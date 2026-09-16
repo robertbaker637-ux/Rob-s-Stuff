@@ -63,10 +63,11 @@ export default async function BudgetPage() {
   const billsInWindow = getBillsInWindow(bills, currentWindow, canonicalSchedule);
   const sweepAmount = computeSweepAmount(incomeForWindow, billsInWindow, categoryWindowBudgets);
 
-  // Illustrative cross-month window, to make the calendar-reporting
-  // proration visible even when "today"'s window doesn't happen to span
-  // a month boundary (see calendarReporting.ts and the rv2.1 plan).
-  const crossMonthWindow = computeCanonicalWindow(canonicalSchedule, "2026-01-31");
+  // As of SEED_TODAY, the current operating window IS the one that
+  // crosses the Jan/Feb boundary (2026-01-30 - 2026-02-13), so the
+  // calendar-reporting proration below is shown for the same window as
+  // the rest of this page — not a separate illustrative example.
+  const crossMonthWindow = currentWindow;
   const groceriesBudgetForCrossMonthWindow =
     getCurrentWindowBudget(categoryWindowBudgets, "cat-groceries", crossMonthWindow.start) ?? 0;
   const crossMonthAttribution = prorateWindowAcrossMonths(
@@ -144,12 +145,13 @@ export default async function BudgetPage() {
         </p>
       </Card>
 
-      <Card title="Calendar-month reporting (illustrative — read-only)">
+      <Card title="Calendar-month reporting (read-only)">
         <p className="mb-3 text-xs text-neutral-500">
-          The {formatDate(crossMonthWindow.start)} – {formatDate(crossMonthWindow.end)} window
+          The current window ({formatDate(crossMonthWindow.start)} – {formatDate(crossMonthWindow.end)})
           spans January and February. Its Groceries budget of{" "}
           {formatCurrency(groceriesBudgetForCrossMonthWindow)} is prorated below by day-count for
-          calendar reporting only — this never changes the operational window balance above.
+          calendar reporting only — this never changes the operational window balance shown for
+          Groceries above.
         </p>
         <ul className="divide-y divide-surface-border">
           {crossMonthAttribution.map((a) => (

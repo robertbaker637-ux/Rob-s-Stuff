@@ -1,14 +1,16 @@
 import { Card } from "@/components/Card";
 import { ProgressBar } from "@/components/ProgressBar";
+import { getEffectiveAmount } from "@/lib/domain/paycheck";
 import { computeCanonicalWindow } from "@/lib/domain/payWindow";
 import { seedRepository } from "@/lib/data/seedRepository";
 import { SEED_TODAY } from "@/lib/ui/seedToday";
 import { daysBetweenIso, formatCurrency, formatDate } from "@/lib/ui/format";
 
 export default async function DashboardPage() {
-  const [accounts, paychecks, bills, sinkingFunds, transactions, canonicalSchedule] =
+  const [accounts, incomeSources, paychecks, bills, sinkingFunds, transactions, canonicalSchedule] =
     await Promise.all([
       seedRepository.getAccounts(),
+      seedRepository.getIncomeSources(),
       seedRepository.getPaychecks(),
       seedRepository.getBills(),
       seedRepository.getSinkingFunds(),
@@ -22,16 +24,33 @@ export default async function DashboardPage() {
   // system (that's out of scope this pass — see rv2.1 plan).
   const actualIncome = paychecks
     .filter((p) => p.isActual)
-    .reduce((sum, p) => sum + p.net, 0);
+    .reduce((sum, p) => sum + getEffectiveAmount(p), 0);
   const spent = transactions
     .filter((t) => !t.isTransfer)
     .reduce((sum, t) => sum + t.amount, 0);
   const paidBills = bills.filter((b) => b.paidStatus).reduce((sum, b) => sum + b.amount, 0);
   const projectedBalance = actualIncome - spent - paidBills;
 
-  const nextPaycheck = paychecks
-    .filter((p) => !p.isActual && p.payDate >= SEED_TODAY)
-    .sort((a, b) => (a.payDate < b.payDate ? -1 : 1))[0];
+  // Next CANONICAL Circle K payday: derived directly from the schedule,
+  // never from paycheck rows. This is always computable — it doesn't
+  // depend on a paycheck record existing for it — and it's the date that
+  // actually opens the next operating window.
+  const nextCanonicalPayday = currentWindow.end;
+  const nextCanonicalPaycheck = paychecks.find(
+    (p) => p.incomeSourceId === "src-ck" && !p.isActual && p.projectedPayDate === nextCanonicalPayday
+  );
+
+  // Next EXPECTED INCOME: the earliest still-projected paycheck across
+  // ANY regular income source (Circle K included, but not exclusively).
+  // This is a genuinely different question from "when does the next
+  // operating window open" — e.g. Church can have a projected payday
+  // before Circle K's, and this card is allowed to show that.
+  const nextExpectedIncome = paychecks
+    .filter((p) => !p.isActual && p.projectedPayDate !== undefined && p.projectedPayDate >= SEED_TODAY)
+    .sort((a, b) => (a.projectedPayDate! < b.projectedPayDate! ? -1 : 1))[0];
+  const nextExpectedIncomeSource = nextExpectedIncome
+    ? incomeSources.find((s) => s.id === nextExpectedIncome.incomeSourceId)
+    : undefined;
 
   const billsDueSoon = bills
     .filter((b) => !b.paidStatus && b.dueDate >= SEED_TODAY)
@@ -59,23 +78,37 @@ export default async function DashboardPage() {
           </p>
         </Card>
 
-        <Card title="Next Payday">
-          {nextPaycheck ? (
+        <Card title="Next Circle K Payday (canonical)">
+          <p className="text-3xl font-semibold text-neutral-50">
+            {daysBetweenIso(SEED_TODAY, nextCanonicalPayday)} days
+          </p>
+          <p className="mt-2 text-xs text-neutral-500">
+            {formatDate(nextCanonicalPayday)}
+            {nextCanonicalPaycheck && ` · expected ${formatCurrency(nextCanonicalPaycheck.projectedAmount ?? 0)}`}
+            {" "}· opens the next operating window
+          </p>
+        </Card>
+
+        <Card title="Next Expected Income (any source)">
+          {nextExpectedIncome ? (
             <>
               <p className="text-3xl font-semibold text-neutral-50">
-                {daysBetweenIso(SEED_TODAY, nextPaycheck.payDate)} days
+                {daysBetweenIso(SEED_TODAY, nextExpectedIncome.projectedPayDate!)} days
               </p>
               <p className="mt-2 text-xs text-neutral-500">
-                {formatDate(nextPaycheck.payDate)} · expected{" "}
-                {formatCurrency(nextPaycheck.expectedPerPaycheck ?? 0)}
+                {nextExpectedIncomeSource?.name} · {formatDate(nextExpectedIncome.projectedPayDate!)} ·
+                expected {formatCurrency(nextExpectedIncome.projectedAmount ?? 0)}
               </p>
             </>
           ) : (
-            <p className="text-sm text-neutral-500">No upcoming paycheck in seed data.</p>
+            <p className="text-sm text-neutral-500">No projected income in seed data.</p>
           )}
+          <p className="mt-2 text-xs text-neutral-600">
+            Informational only — does not drive the operating window (see Circle K card).
+          </p>
         </Card>
 
-        <Card title="Bills Due Soon" className="sm:col-span-2">
+        <Card title="Bills Due Soon">
           {billsDueSoon.length === 0 ? (
             <p className="text-sm text-neutral-500">Nothing due — you&apos;re clear.</p>
           ) : (

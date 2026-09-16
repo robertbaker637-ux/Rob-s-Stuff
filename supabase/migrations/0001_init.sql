@@ -1,4 +1,5 @@
--- BASELINE v2 rv2.1 — initial schema
+-- BASELINE v2 rv2.1 — initial schema (paychecks/income_sources amended in
+-- rv2.2 for projected/actual reconciliation — see CHANGELOG v2 rv2.2).
 --
 -- Core entities for build-sequence steps 1-3: accounts, income sources /
 -- pay schedules, paychecks, categories / category window budgets, bills,
@@ -11,6 +12,12 @@
 -- Steady category budgets are a per-window baseline (category_window_budgets),
 -- never a monthly amount divided across paydays. Calendar month/quarter/year
 -- are reporting-only rollups computed in application code, not stored here.
+--
+-- This migration is amended in place rather than superseded by a new
+-- migration file: nothing has ever been applied to a live Supabase
+-- project (rv2.1 shipped with no connection at all — see .env.example),
+-- so there is no deployed schema to migrate away from yet. Once a real
+-- project exists, changes after that point get their own migration files.
 --
 -- Every table is scoped to a single user via `user_id` + row-level security,
 -- laying the multi-user foundation the brief requires from day one even
@@ -78,10 +85,16 @@ create table income_sources (
   name text not null,
   type income_source_type not null,
   is_primary_window_source boolean not null default false,
-  expected_monthly numeric(12, 2), -- irregular sources only; planning estimate
+  -- Regular sources only: the Setup baseline projectExpectedPaychecks()
+  -- forecasts future paycheck events from.
+  expected_per_paycheck numeric(12, 2),
+  -- Irregular sources only: a monthly planning estimate.
+  expected_monthly numeric(12, 2),
   created_at timestamptz not null default now(),
-  constraint irregular_has_no_expected_per_paycheck_context
-    check (type = 'irregular' or expected_monthly is null)
+  constraint regular_has_no_expected_monthly
+    check (type = 'irregular' or expected_monthly is null),
+  constraint irregular_has_no_expected_per_paycheck
+    check (type = 'regular' or expected_per_paycheck is null)
 );
 
 alter table income_sources enable row level security;
@@ -146,18 +159,33 @@ create policy "pay_schedules_all_own" on pay_schedules
 -- paychecks
 -- ============================================================================
 
+-- A paycheck EVENT, which may carry a projected side, an actual side, or
+-- both — never collapsed into one pay_date/amount pair. Reconciliation
+-- (rv2.2) populates the actual_* columns onto the SAME row rather than
+-- overwriting projected_*, so the original forecast survives for
+-- variance/history after a real deposit is matched. is_actual is the
+-- reconciliation status: false = projected_* authoritative, true =
+-- actual_* authoritative for all downstream math and canonical-window
+-- assignment (see src/lib/domain/paycheck.ts).
 create table paychecks (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
   income_source_id uuid not null references income_sources (id) on delete cascade,
-  pay_date date not null,
-  gross numeric(12, 2),
+  -- Regular sources only — set by projectExpectedPaychecks().
+  projected_pay_date date,
+  projected_amount numeric(12, 2),
+  -- Populated once reconciled (any source type).
+  actual_pay_date date,
+  actual_amount numeric(12, 2),
+  actual_gross numeric(12, 2),
   auto_split_amount numeric(12, 2) not null default 0,
   auto_split_destination_account_id uuid references accounts (id) on delete set null,
-  net numeric(12, 2) not null,
-  expected_per_paycheck numeric(12, 2), -- regular sources only, set in Setup
   is_actual boolean not null default false,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  constraint actual_fields_required_once_reconciled
+    check (not is_actual or (actual_pay_date is not null and actual_amount is not null)),
+  constraint has_a_projected_or_actual_side
+    check (projected_pay_date is not null or actual_pay_date is not null)
 );
 
 alter table paychecks enable row level security;
@@ -167,7 +195,8 @@ create policy "paychecks_all_own" on paychecks
 
 create index paychecks_user_id_idx on paychecks (user_id);
 create index paychecks_income_source_id_idx on paychecks (income_source_id);
-create index paychecks_pay_date_idx on paychecks (pay_date);
+create index paychecks_projected_pay_date_idx on paychecks (projected_pay_date);
+create index paychecks_actual_pay_date_idx on paychecks (actual_pay_date);
 
 -- No stored window_start/window_end: canonical-window membership for any
 -- income source's paycheck is derived at query time against the primary

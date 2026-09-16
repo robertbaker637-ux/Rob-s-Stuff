@@ -11,9 +11,27 @@ const ckSchedule: PaySchedule = {
 
 const window = { start: "2026-01-02", end: "2026-01-16" };
 
-const ck: IncomeSource = { id: "src-ck", name: "Circle K", type: "regular", isPrimaryWindowSource: true };
-const church: IncomeSource = { id: "src-church", name: "Church", type: "regular", isPrimaryWindowSource: false };
-const gig: IncomeSource = { id: "src-gig", name: "Gig", type: "irregular", isPrimaryWindowSource: false };
+const ck: IncomeSource = {
+  id: "src-ck",
+  name: "Circle K",
+  type: "regular",
+  isPrimaryWindowSource: true,
+  expectedPerPaycheck: 1650,
+};
+const church: IncomeSource = {
+  id: "src-church",
+  name: "Church",
+  type: "regular",
+  isPrimaryWindowSource: false,
+  expectedPerPaycheck: 200,
+};
+const gig: IncomeSource = {
+  id: "src-gig",
+  name: "Gig",
+  type: "irregular",
+  isPrimaryWindowSource: false,
+  expectedMonthly: 400,
+};
 
 const categoryBudgets: CategoryWindowBudget[] = [
   { id: "b-groceries", categoryId: "cat-groceries", amount: 150, effectiveFrom: "2025-01-01" },
@@ -23,9 +41,9 @@ const categoryBudgets: CategoryWindowBudget[] = [
 const ckActualPaycheck: Paycheck = {
   id: "pc-ck-1",
   incomeSourceId: "src-ck",
-  payDate: "2026-01-02",
   autoSplitAmount: 0,
-  net: 1650,
+  actualPayDate: "2026-01-02",
+  actualAmount: 1650,
   isActual: true,
 };
 
@@ -45,8 +63,6 @@ describe("computeSweepAmount", () => {
 
     expect(heavySweep).toBe(1650 - 760 - 200); // 690
     expect(lightSweep).toBe(1650 - 0 - 200); // 1450
-    // Same income, same category budgets passed to both calls — only the
-    // bill total differs, and that's exactly what moved.
     expect(lightSweep - heavySweep).toBe(760);
   });
 });
@@ -56,18 +72,17 @@ describe("computeIncomeForWindow — multi-source aggregation", () => {
     const churchActual: Paycheck = {
       id: "pc-church-1",
       incomeSourceId: "src-church",
-      payDate: "2026-01-04",
       autoSplitAmount: 0,
-      net: 210,
+      actualPayDate: "2026-01-04",
+      actualAmount: 210,
       isActual: true,
     };
-    const churchExpected: Paycheck = {
+    const churchProjected: Paycheck = {
       id: "pc-church-2",
       incomeSourceId: "src-church",
-      payDate: "2026-01-11",
       autoSplitAmount: 0,
-      net: 0,
-      expectedPerPaycheck: 200,
+      projectedPayDate: "2026-01-11",
+      projectedAmount: 200,
       isActual: false,
     };
 
@@ -75,7 +90,7 @@ describe("computeIncomeForWindow — multi-source aggregation", () => {
       window,
       ckSchedule,
       [ck, church],
-      [ckActualPaycheck, churchActual, churchExpected]
+      [ckActualPaycheck, churchActual, churchProjected]
     );
 
     expect(income).toBe(1650 + 210 + 200);
@@ -85,18 +100,20 @@ describe("computeIncomeForWindow — multi-source aggregation", () => {
     const gigActual: Paycheck = {
       id: "pc-gig-1",
       incomeSourceId: "src-gig",
-      payDate: "2026-01-08",
       autoSplitAmount: 0,
-      net: 300,
+      actualPayDate: "2026-01-08",
+      actualAmount: 300,
       isActual: true,
     };
-    const gigNotYetActual: Paycheck = {
+    // Defensive: a malformed non-actual gig row that somehow has
+    // projected* fields set must still be ignored — irregular income
+    // never gets a forecast, regardless of what's on the record.
+    const gigMalformedProjected: Paycheck = {
       id: "pc-gig-2",
       incomeSourceId: "src-gig",
-      payDate: "2026-01-10",
       autoSplitAmount: 0,
-      net: 0,
-      expectedPerPaycheck: 999, // irregular sources don't get an expected value; must be ignored
+      projectedPayDate: "2026-01-10",
+      projectedAmount: 999,
       isActual: false,
     };
 
@@ -104,7 +121,7 @@ describe("computeIncomeForWindow — multi-source aggregation", () => {
       window,
       ckSchedule,
       [ck, gig],
-      [ckActualPaycheck, gigActual, gigNotYetActual]
+      [ckActualPaycheck, gigActual, gigMalformedProjected]
     );
 
     expect(income).toBe(1650 + 300 + 0);

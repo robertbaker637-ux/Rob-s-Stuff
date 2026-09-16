@@ -4,6 +4,9 @@ import {
   filterTransactionsForCategoryWindow,
   getCurrentWindowBudget,
 } from "@/lib/domain/categoryAllocation";
+import { prorateWindowAcrossMonths } from "@/lib/domain/calendarReporting";
+import { computeCanonicalWindow } from "@/lib/domain/payWindow";
+import { canonicalPaySchedule, seedCategoryWindowBudgets, seedTransactions } from "@/lib/data/seed";
 import type { CategoryWindowBudget, PaySchedule, Transaction } from "@/lib/domain/types";
 
 const ckSchedule: PaySchedule = {
@@ -86,6 +89,45 @@ describe("filterTransactionsForCategoryWindow + computeCategoryBalanceForWindow"
 
     const budget = getCurrentWindowBudget(groceriesBudgets, "cat-groceries", window.start)!;
     expect(computeCategoryBalanceForWindow(budget, inWindow)).toBe(100); // 150 - 20 - 30
+  });
+
+  it("real seed fixture: $150 baseline, $40 spent Jan 31 + $30 spent Feb 3 in the SAME cross-month window, remaining exactly $80 — no reset on Feb 1, and calendar-reporting proration never changes this number", () => {
+    // Window 3 in the seed fixture (2026-01-30 - 2026-02-13) is the one
+    // that crosses the Jan/Feb boundary. This uses the actual committed
+    // fixture, not a synthetic one.
+    const window = computeCanonicalWindow(canonicalPaySchedule, "2026-02-05");
+    expect(window).toEqual({ start: "2026-01-30", end: "2026-02-13" });
+
+    const budget = getCurrentWindowBudget(seedCategoryWindowBudgets, "cat-groceries", window.start)!;
+    expect(budget).toBe(150);
+
+    const inWindow = filterTransactionsForCategoryWindow(
+      seedTransactions,
+      "cat-groceries",
+      window,
+      canonicalPaySchedule
+    );
+    // txn-6 ($40, Jan 31) and txn-7 ($30, Feb 3) — both real seeded rows.
+    expect(inWindow.map((t) => t.id).sort()).toEqual(["txn-6", "txn-7"]);
+    expect(inWindow.find((t) => t.id === "txn-6")?.postedDate).toBe("2026-01-31");
+    expect(inWindow.find((t) => t.id === "txn-6")?.amount).toBe(40);
+    expect(inWindow.find((t) => t.id === "txn-7")?.postedDate).toBe("2026-02-03");
+    expect(inWindow.find((t) => t.id === "txn-7")?.amount).toBe(30);
+
+    const operationalBalance = computeCategoryBalanceForWindow(budget, inWindow);
+    expect(operationalBalance).toBe(80); // 150 - 40 - 30, no reset at Feb 1
+
+    // Calendar reporting attributes the same $150 baseline across the two
+    // calendar months by day-count, and each transaction keeps its own
+    // real posted_date for reporting — but neither changes the $80
+    // operational figure just computed above.
+    const attribution = prorateWindowAcrossMonths(window, budget);
+    expect(attribution).toEqual([
+      { year: 2026, month: 1, days: 2, amount: 21.43 }, // Jan 30-31
+      { year: 2026, month: 2, days: 12, amount: 128.57 }, // Feb 1-12
+    ]);
+    const balanceAfterReporting = computeCategoryBalanceForWindow(budget, inWindow);
+    expect(balanceAfterReporting).toBe(80);
   });
 
   it("excludes transfers from a category's window balance", () => {

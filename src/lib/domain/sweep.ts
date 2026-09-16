@@ -1,4 +1,5 @@
-// Sweep formula (rv2.1).
+// Sweep formula (rv2.1, income aggregation updated in rv2.2 for the
+// projected/actual paycheck split — see paycheck.ts).
 //
 // sweep = total income assigned to the canonical window
 //         − bills due in that window
@@ -8,6 +9,7 @@
 // canonical window contributes to that window's total, whether or not it
 // came from the income source that defines the window's boundaries.
 
+import { getEffectiveAmount, getEffectivePayDate } from "./paycheck";
 import { assignDateToCanonicalWindow } from "./payWindow";
 import type {
   Bill,
@@ -19,30 +21,16 @@ import type {
 } from "./types";
 
 /**
- * Every paycheck (from any income source) whose pay_date falls in
- * `window`. Church's own paydays land here alongside Circle K's, and gig
- * deposits land here too, all bucketed purely by date against the
- * canonical schedule.
- */
-function paychecksInWindow(
-  window: CanonicalWindow,
-  canonicalPaySchedule: PaySchedule,
-  paychecks: Paycheck[]
-): Paycheck[] {
-  return paychecks.filter((p) => {
-    const assigned = assignDateToCanonicalWindow(p.payDate, canonicalPaySchedule);
-    return assigned.start === window.start && assigned.end === window.end;
-  });
-}
-
-/**
  * Sums every paycheck/deposit assigned into `window` across all income
- * sources:
- *  - Regular sources (Circle K, Church): Actual net once known, else
- *    that source's own expected_per_paycheck while still projected.
- *  - Irregular sources (gig): only actual deposits count; there is no
- *    expected contribution, since irregular income has no schedule to
- *    project one from.
+ * sources, using each record's effective (actual-if-reconciled, else
+ * projected) date and amount:
+ *  - Regular sources (Circle K, Church): Actual once reconciled, else
+ *    that source's own projected amount while still a forecast.
+ *  - Irregular sources (gig): only reconciled (actual) deposits count.
+ *    This is enforced defensively here, independent of whether a
+ *    projected* field happens to be set on the record — irregular income
+ *    must never contribute a forecast amount, since it has no schedule
+ *    to have projected one from in the first place.
  */
 export function computeIncomeForWindow(
   window: CanonicalWindow,
@@ -51,19 +39,23 @@ export function computeIncomeForWindow(
   paychecks: Paycheck[]
 ): number {
   const sourceById = new Map(incomeSources.map((s) => [s.id, s]));
-  const inWindow = paychecksInWindow(window, canonicalPaySchedule, paychecks);
 
-  return inWindow.reduce((sum, paycheck) => {
+  return paychecks.reduce((sum, paycheck) => {
     const source = sourceById.get(paycheck.incomeSourceId);
     if (!source) return sum;
 
     if (source.type === "irregular") {
-      return paycheck.isActual ? sum + paycheck.net : sum;
+      if (!paycheck.isActual || !paycheck.actualPayDate) return sum;
+      const assigned = assignDateToCanonicalWindow(paycheck.actualPayDate, canonicalPaySchedule);
+      if (assigned.start !== window.start || assigned.end !== window.end) return sum;
+      return sum + (paycheck.actualAmount ?? 0);
     }
 
-    // Regular source: Actual once known, else its own expected baseline.
-    const amount = paycheck.isActual ? paycheck.net : paycheck.expectedPerPaycheck ?? 0;
-    return sum + amount;
+    const payDate = getEffectivePayDate(paycheck);
+    if (!payDate) return sum;
+    const assigned = assignDateToCanonicalWindow(payDate, canonicalPaySchedule);
+    if (assigned.start !== window.start || assigned.end !== window.end) return sum;
+    return sum + getEffectiveAmount(paycheck);
   }, 0);
 }
 

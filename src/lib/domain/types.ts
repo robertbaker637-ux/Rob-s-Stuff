@@ -31,8 +31,12 @@ export interface IncomeSource {
   /** At most one income source has this true; exactly one is required by
    * application validation before canonical-window math runs. */
   isPrimaryWindowSource: boolean;
+  /** Regular sources only — the Setup baseline used by
+   * projectExpectedPaychecks to forecast future paycheck events. */
+  expectedPerPaycheck?: number;
   /** Irregular sources only — a monthly planning estimate, never a
-   * per-paycheck expectation. */
+   * per-paycheck expectation (irregular income has no schedule to attach
+   * a per-paycheck figure to). */
   expectedMonthly?: number;
 }
 
@@ -50,16 +54,34 @@ export interface PaySchedule {
   semimonthlyDayB?: number;
 }
 
+/**
+ * A single paycheck EVENT, which may carry a projected side, an actual
+ * side, or both — never collapsed into one field. This is what lets a
+ * reconciled paycheck keep its original forecast (date/amount) alongside
+ * the real deposit once Plaid confirms it, for variance/history, rather
+ * than overwriting the projection in place.
+ *
+ * `isActual` is the reconciliation status: false = still a forecast
+ * (projected* fields authoritative), true = reconciled (actual* fields
+ * authoritative for all downstream math and canonical-window assignment).
+ * Regular sources get a projected side from projectExpectedPaychecks();
+ * irregular (gig) sources never do — they only ever have an actual side,
+ * created once a real deposit is known.
+ */
 export interface Paycheck {
   id: string;
   incomeSourceId: string;
-  payDate: IsoDate;
-  gross?: number;
+  /** Forecast date/amount at the time this event was projected. Regular
+   * sources only. */
+  projectedPayDate?: IsoDate;
+  projectedAmount?: number;
+  /** Real deposit date/amount once reconciled. Required when isActual is
+   * true; absent otherwise. */
+  actualPayDate?: IsoDate;
+  actualAmount?: number;
+  actualGross?: number;
   autoSplitAmount: number;
   autoSplitDestinationAccountId?: string;
-  net: number;
-  /** Regular sources only, set in Setup. */
-  expectedPerPaycheck?: number;
   isActual: boolean;
 }
 
