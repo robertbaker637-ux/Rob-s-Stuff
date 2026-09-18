@@ -12,17 +12,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { plaidClient } from "@/lib/plaid/client";
 import { sanitizePlaidError } from "@/lib/plaid/errors";
-import { createPlaidFetchPage } from "@/lib/plaid/syncAdapters";
+import { createPlaidFetchPage, mapLiabilitiesResponseToLiabilityData } from "@/lib/plaid/syncAdapters";
 import { runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
 import {
   insertPlaidItem,
+  loadMerchantRules,
   persistAccounts,
   persistDebts,
   persistTransactions,
   updateItemCursor,
 } from "@/lib/plaid/persistence";
 import { syncPlaidAccounts, syncPlaidLiabilities } from "@/lib/domain/plaidSync";
-import type { PlaidAccountData, PlaidLiabilityData } from "@/lib/domain/types";
+import type { PlaidAccountData } from "@/lib/domain/types";
 
 export async function POST(request: NextRequest) {
   const { publicToken, userId } = await request.json();
@@ -59,23 +60,21 @@ export async function POST(request: NextRequest) {
     await persistAccounts(userId, accounts);
     const accountIdByPlaidAccountId = new Map(accounts.map((a) => [a.plaidAccountId!, a.id]));
 
-    // Liabilities (credit-card shape only this pass — mortgage/student
-    // loan liabilities have different fields and aren't modeled by our
-    // Debt entity yet).
+    // Liabilities: credit cards, mortgages, and student loans, via the
+    // one adapter allowed to know Plaid's real liability shapes
+    // (mapLiabilitiesResponseToLiabilityData). A credit-card or
+    // student-loan record with a null account_id is skipped rather than
+    // given a synthesized identity — logged as a count/kind only, never
+    // the raw Plaid payload.
     try {
       const liabilitiesResponse = await plaidClient.liabilitiesGet({ access_token: accessToken });
-      const balanceByAccountId = new Map(
-        liabilitiesResponse.data.accounts.map((a) => [a.account_id, a.balances.current ?? 0])
-      );
-      const liabilities: PlaidLiabilityData[] = (liabilitiesResponse.data.liabilities.credit ?? [])
-        .filter((l) => l.account_id)
-        .map((l) => ({
-          plaidLiabilityId: l.account_id!,
-          currentBalance: balanceByAccountId.get(l.account_id!) ?? 0,
-          apr: l.aprs[0]?.apr_percentage,
-          minimumPaymentAmount: l.minimum_payment_amount ?? undefined,
-          accountName: liabilitiesResponse.data.accounts.find((a) => a.account_id === l.account_id)?.name,
-        }));
+      const { liabilities, skipped } = mapLiabilitiesResponseToLiabilityData(liabilitiesResponse.data);
+      if (skipped.length > 0) {
+        console.warn(
+          "Plaid liabilities with missing account_id skipped:",
+          skipped.map((s) => s.kind)
+        );
+      }
       if (liabilities.length > 0) {
         const debts = syncPlaidLiabilities([], liabilities);
         await persistDebts(userId, debts);
@@ -88,12 +87,16 @@ export async function POST(request: NextRequest) {
 
     // Initial transactions sync, same orchestration used for every
     // later sync (webhook-driven or manual) — no separate code path.
+    // Loads the user's existing merchant rules so a known merchant
+    // arriving during the first import is categorized on arrival rather
+    // than landing in the review queue.
+    const merchantRules = await loadMerchantRules(userId);
     const { syncResult, newCursor } = await runPlaidTransactionsSync({
       fetchPage: createPlaidFetchPage(accessToken),
       startingCursor: "",
       localTransactions: [],
       accountIdByPlaidAccountId,
-      merchantRules: [], // TODO(rv2.5+): load the user's existing merchant rules
+      merchantRules,
       persistTransactions: (transactions) => persistTransactions(userId, transactions),
     });
     await updateItemCursor(item.id, newCursor);

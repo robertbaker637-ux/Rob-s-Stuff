@@ -324,7 +324,15 @@ create table debts (
   balance numeric(12, 2) not null,
   apr numeric(6, 3),
   minimum_payment numeric(12, 2),
-  plaid_liability_id text,
+  -- rv2.5: renamed from plaid_liability_id, which was never correct —
+  -- Plaid liability records have no separate provider liability_id, only
+  -- an account_id (verified against the Plaid SDK's
+  -- CreditCardLiability/MortgageLiability/StudentLoan types).
+  plaid_account_id text,
+  liability_type text,
+  next_payment_due_date date,
+  is_overdue boolean,
+  raw_liability_details jsonb,
   created_at timestamptz not null default now()
 );
 

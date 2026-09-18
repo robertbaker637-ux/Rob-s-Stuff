@@ -1,18 +1,33 @@
-// Plaid webhook receiver. Only TRANSACTIONS/SYNC_UPDATES_AVAILABLE is
-// dispatched anywhere (via routeTransactionsWebhook, the same function
-// tested in tests/plaid/webhookHandlers.test.ts) — every other webhook
-// type/code is acknowledged and ignored this pass.
+// Plaid webhook receiver (rv2.5: signature-verified).
 //
-// NOTE: this does not yet verify Plaid's webhook JWT signature
-// (`plaid-verification-key-id` header + Plaid's public key endpoint).
-// That's necessary before this route is exposed on a real deployment —
-// flagged here deliberately rather than silently skipped.
+// The raw request body is captured via request.text() FIRST, before any
+// JSON parsing — reading it as text and JSON.parse-ing that same string
+// afterward (rather than also calling request.json()) is what lets the
+// SHA-256 body-hash check in verifyPlaidWebhook run against Plaid's exact
+// byte sequence. Two separate reads of a Request body aren't guaranteed
+// reliable, and re-serializing a parsed object would not reproduce
+// Plaid's exact bytes.
+//
+// Verification runs BEFORE any dispatch: a missing Plaid-Verification
+// header or a failed verifyPlaidWebhook call returns 401 immediately —
+// no JSON.parse of the body for dispatch, no getItemByPlaidItemId, no
+// routeTransactionsWebhook call, no cursor/historical-flag update. Every
+// existing downstream dependency only runs after verification succeeds.
+//
+// Only TRANSACTIONS/SYNC_UPDATES_AVAILABLE is dispatched anywhere (via
+// routeTransactionsWebhook) — every other webhook type/code is
+// acknowledged and ignored this pass.
+//
+// Nothing here ever logs the JWT, the raw body, or key material — only
+// the fixed reason string from verifyPlaidWebhook, or sanitizePlaidError
+// output, is ever logged.
 
 import { NextRequest, NextResponse } from "next/server";
 import { routeTransactionsWebhook, type PlaidWebhookPayload } from "@/lib/plaid/webhookHandlers";
 import { sanitizePlaidError } from "@/lib/plaid/errors";
-import { createPlaidFetchPage } from "@/lib/plaid/syncAdapters";
+import { createPlaidFetchPage, fetchPlaidJwk } from "@/lib/plaid/syncAdapters";
 import { runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
+import { createJwkCache, verifyPlaidWebhook } from "@/lib/plaid/webhookVerification";
 import {
   getItemByPlaidItemId,
   getPlaidItemAccessToken,
@@ -24,6 +39,10 @@ import {
   updateItemCursor,
 } from "@/lib/plaid/persistence";
 import type { PlaidItem } from "@/lib/domain/types";
+
+// Module-scoped so the JWK cache survives across requests within the
+// same server instance — created once, reused by every POST.
+const jwkCache = createJwkCache(fetchPlaidJwk);
 
 async function runSyncForItem(item: PlaidItem): Promise<void> {
   const [localTransactions, accountIdByPlaidAccountId, merchantRules, accessToken] = await Promise.all([
@@ -46,7 +65,21 @@ async function runSyncForItem(item: PlaidItem): Promise<void> {
 }
 
 export async function POST(request: NextRequest) {
-  const payload = (await request.json()) as PlaidWebhookPayload;
+  const rawBody = await request.text();
+
+  const jwt = request.headers.get("Plaid-Verification");
+  if (!jwt) {
+    console.error("Plaid webhook rejected: missing Plaid-Verification header");
+    return NextResponse.json({ error: "missing_verification_header" }, { status: 401 });
+  }
+
+  const verification = await verifyPlaidWebhook({ jwt, rawBody, getJwk: jwkCache.getJwk });
+  if (!verification.valid) {
+    console.error("Plaid webhook rejected:", verification.reason);
+    return NextResponse.json({ error: verification.reason }, { status: 401 });
+  }
+
+  const payload = JSON.parse(rawBody) as PlaidWebhookPayload;
 
   if (payload.webhook_type !== "TRANSACTIONS") {
     return NextResponse.json({ received: true }); // out of scope this pass

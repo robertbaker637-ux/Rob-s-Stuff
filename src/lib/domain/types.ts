@@ -127,14 +127,36 @@ export interface SinkingFund {
   fundingAccountId?: string;
 }
 
+export type LiabilityType = "credit_card" | "mortgage" | "student_loan" | "other";
+
+/** A JSON-safe value: what can actually survive round-tripping through
+ * Postgres jsonb / JSON.stringify. Recursive so it can hold nested
+ * structures like an array of APR entries, never `any`. */
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
 export interface Debt {
   id: string;
   name: string;
   balance: number;
   apr?: number;
   minimumPayment?: number;
-  /** Set once linked via Plaid Liabilities. Absent for manually-entered debts. */
-  plaidLiabilityId?: string;
+  /** Plaid's real, stable identity for a liability — an account_id.
+   * There is no separate provider liability_id to key off (verified
+   * against the Plaid SDK's CreditCardLiability/MortgageLiability/
+   * StudentLoan types — none carry a liability_id field). Absent for
+   * manually-entered debts. */
+  plaidAccountId?: string;
+  /** Existing debts stay valid without this — absent means "other"/unknown. */
+  liabilityType?: LiabilityType;
+  nextPaymentDueDate?: IsoDate;
+  isOverdue?: boolean;
+  /** Type-specific Plaid fields (and the full aprs[] array for credit
+   * cards) that don't have a first-class BASELINE meaning of their own
+   * yet. Preserved rather than dropped or coerced into a credit-card-
+   * shaped field. Not typed against Plaid's SDK; this is our own bag of
+   * named values. */
+  rawLiabilityDetails?: Record<string, JsonValue>;
 }
 
 /**
@@ -322,11 +344,56 @@ export interface PlaidAccountData {
   subtype?: string;
 }
 
-export interface PlaidLiabilityData {
-  plaidLiabilityId: string;
+/** One entry from Plaid's credit-card aprs[] array, preserved in full —
+ * every field, not just type/percentage — so no part of a non-purchase
+ * APR entry (cash, balance-transfer, penalty, promotional) is silently
+ * dropped. A subfield Plaid's response omits stays undefined, never 0. */
+export interface PlaidAprEntry {
+  aprType: string;
+  aprPercentage: number;
+  balanceSubjectToApr?: number;
+  interestChargeAmount?: number;
+}
+
+interface PlaidLiabilityDataCommon {
+  /** Required, non-null: a liability whose Plaid account_id is null is
+   * filtered out before this type is ever constructed (see
+   * syncAdapters.ts's mapLiabilitiesResponseToLiabilityData) — there is
+   * no synthesized fallback identity. */
+  plaidAccountId: string;
   currentBalance: number;
-  apr?: number;
-  minimumPaymentAmount?: number;
+  isOverdue?: boolean;
   /** From the paired /accounts/get response, when creating a new Debt. */
   accountName?: string;
+}
+
+export type PlaidLiabilityData =
+  | (PlaidLiabilityDataCommon & {
+      kind: "credit_card";
+      aprs: PlaidAprEntry[];
+      minimumPaymentAmount?: number;
+      lastPaymentAmount?: number;
+      lastPaymentDate?: IsoDate;
+    })
+  | (PlaidLiabilityDataCommon & {
+      kind: "mortgage";
+      interestRatePercentage?: number;
+      nextMonthlyPayment?: number;
+      nextPaymentDueDate?: IsoDate;
+      /** Plaid's real past-due-amount field. isOverdue is derived from
+       * this (> 0), never fabricated when it's absent. */
+      pastDueAmount?: number;
+    })
+  | (PlaidLiabilityDataCommon & {
+      kind: "student_loan";
+      interestRatePercentage?: number;
+      minimumPaymentAmount?: number;
+      nextPaymentDueDate?: IsoDate;
+    });
+
+/** A liability skipped during mapping because Plaid returned a null
+ * account_id — deterministic, non-sensitive, safe to log. */
+export interface SkippedLiability {
+  kind: "credit_card" | "student_loan";
+  reason: "missing_account_id";
 }

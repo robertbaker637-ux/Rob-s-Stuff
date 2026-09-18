@@ -1,5 +1,68 @@
 # BASELINE Changelog
 
+## v2 rv2.5 — 2026-09-18
+
+Plaid Integration Hardening & Liability Completion. Closes the three gaps
+rv2.4 flagged rather than hid, before Step 6 (balance reconciliation)
+begins. No live Plaid/Supabase project yet — the webhook crypto is real
+and self-testable (real signed JWTs minted in tests against a real P-256
+keypair, via Node's own `crypto` and `jose`); everything else follows
+rv2.1-2.4's established pattern. `payWindow.ts`, `paycheck.ts`,
+`sweep.ts`, `categoryAllocation.ts`, `calendarReporting.ts`,
+`merchantMemory.ts`, `transactionSplits.ts`, and `transferDetection.ts`
+have zero diff — confirmed with `git diff --stat` before committing.
+
+- **Plaid webhook JWT verification** (`src/lib/plaid/webhookVerification.ts`).
+  Uses `jose` for protected-header decoding, JWK import, ES256 signature
+  verification, and the 5-minute issued-at tolerance, rather than
+  hand-rolled JWT primitives. `kid` is read from the header and used to
+  fetch/cache the matching Plaid JWK (`createJwkCache`, keyed by kid,
+  freshness compared against `expired_at` as a timestamp — never treated
+  as expired merely because `expired_at` is non-null). A fetched JWK is
+  validated (`kid`/`kty`/`crv`/`use`/`alg`) before any verification is
+  attempted. The raw-body SHA-256 hash is compared to the JWT's
+  `request_body_sha256` claim in **constant time**
+  (`crypto.timingSafeEqual`, with an explicit equal-length check first —
+  `timingSafeEqual` throws rather than returning false on a length
+  mismatch). The webhook route (`src/app/api/plaid/webhook/route.ts`,
+  rewritten) captures the raw body via `request.text()` before any JSON
+  parsing, and verification runs before any dispatch: a missing header or
+  failed verification returns 401 immediately, with zero calls to
+  `getItemByPlaidItemId`/`runSync`/`markHistoricalPullComplete` — proven
+  structurally by a route-level test harness, not just by return value.
+- **Merchant rules on the initial Plaid sync**
+  (`src/app/api/plaid/exchange-public-token/route.ts`). Fixed a real bug:
+  the first-ever sync passed `merchantRules: []` instead of the user's
+  actual saved rules (already loaded correctly by `/sync` and the
+  webhook route). A known merchant arriving during the first import is
+  now categorized on arrival instead of landing in the review queue.
+- **Complete liability mapping** — mortgages and student loans, not just
+  credit cards (`src/lib/domain/plaidSync.ts`, `src/lib/plaid/syncAdapters.ts`).
+  `Debt`/`PlaidLiabilityData` correctly key off `plaidAccountId` (Plaid's
+  real, stable liability identity) rather than rv2.4's fabricated
+  `plaidLiabilityId` — verified against the Plaid SDK's
+  `CreditCardLiability`/`MortgageLiability`/`StudentLoan` types, none of
+  which carry a separate `liability_id`. `PlaidLiabilityData` is now a
+  discriminated union by `kind`. Credit-card `Debt.apr` is specifically
+  the `purchase_apr` entry (never the first array entry, never
+  fabricated when absent); the complete `aprs` array — including
+  `balanceSubjectToApr`/`interestChargeAmount` — is preserved verbatim in
+  `rawLiabilityDetails`. Mortgage `isOverdue` is derived from Plaid's
+  `pastDueAmount` (`> 0`), staying `undefined` when that field itself is
+  absent rather than defaulting to "not overdue." A credit-card or
+  student-loan record with a null Plaid `account_id` is skipped —
+  logged as a count/kind only — rather than given a synthesized
+  identity; mortgages always carry a real `account_id` per the SDK, so
+  there's no mortgage skip case. `rawLiabilityDetails` is typed as a
+  recursive JSON-safe value (`JsonValue`), replacing a flat type that
+  structurally couldn't hold an array of APR entries.
+- Supabase migration amended in place: `debts.plaid_liability_id`
+  renamed to `debts.plaid_account_id` (correcting a fabricated field
+  from rv2.1, before any liability sync existed), plus new nullable
+  `liability_type`, `next_payment_due_date`, `is_overdue`,
+  `raw_liability_details jsonb` columns.
+- New dependency: `jose` (audited JWT/JWK library).
+
 ## v2 rv2.4 — 2026-09-18
 
 Step 5 of the build sequence: Plaid integration. No live Plaid or

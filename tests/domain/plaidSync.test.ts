@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyPlaidWebhookError,
   createLocalTransactionFromPlaid,
+  mapPlaidLiabilityToDebt,
   mapPlaidTransactionToRaw,
   syncPlaidAccounts,
   syncPlaidLiabilities,
@@ -156,6 +157,21 @@ describe("syncPlaidTransactions — user-corrected category survives a later mod
   });
 });
 
+describe("createLocalTransactionFromPlaid — merchant rules on the initial sync (rv2.5 regression)", () => {
+  it("a known merchant's rule is applied to a brand-new transaction on the very first import, not just later syncs", () => {
+    // Same call shape exchange-public-token/route.ts now makes on a
+    // first-ever sync: real merchant rules passed in, not [].
+    const merchantRules: MerchantRule[] = [
+      { id: "rule-1", merchantKey: "GROCERY MART", categoryId: "cat-groceries" },
+    ];
+
+    const created = createLocalTransactionFromPlaid(plaidTxn(), "acct-checking", merchantRules);
+
+    expect(created.categoryId).toBe("cat-groceries");
+    expect(created.needsReview).toBe(false);
+  });
+});
+
 describe("applyPlaidWebhookError — reconnect/error state without touching historical data", () => {
   it("only returns an updated PlaidItem; it takes no accounts/transactions and so cannot delete them", () => {
     const item: PlaidItem = {
@@ -224,8 +240,183 @@ describe("syncPlaidAccounts — Item/account persistence", () => {
   });
 });
 
+// ============================================================================
+// Liability mapping (rv2.5): credit card / mortgage / student loan
+// ============================================================================
+
+function creditCardLiability(overrides: Record<string, unknown> = {}): PlaidLiabilityData {
+  return {
+    kind: "credit_card",
+    plaidAccountId: "plaid-acct-cc-1",
+    currentBalance: 500,
+    accountName: "Store Card",
+    aprs: [{ aprType: "purchase_apr", aprPercentage: 18.5 }],
+    ...overrides,
+  } as PlaidLiabilityData;
+}
+
+function mortgageLiability(overrides: Record<string, unknown> = {}): PlaidLiabilityData {
+  return {
+    kind: "mortgage",
+    plaidAccountId: "plaid-acct-mortgage-1",
+    currentBalance: 250000,
+    accountName: "Home Mortgage",
+    interestRatePercentage: 6.25,
+    nextPaymentDueDate: "2026-02-01",
+    ...overrides,
+  } as PlaidLiabilityData;
+}
+
+function studentLoanLiability(overrides: Record<string, unknown> = {}): PlaidLiabilityData {
+  return {
+    kind: "student_loan",
+    plaidAccountId: "plaid-acct-loan-1",
+    currentBalance: 15000,
+    accountName: "Federal Loan",
+    interestRatePercentage: 4.5,
+    minimumPaymentAmount: 120,
+    nextPaymentDueDate: "2026-02-15",
+    ...overrides,
+  } as PlaidLiabilityData;
+}
+
+describe("mapPlaidLiabilityToDebt — credit-card APR semantics", () => {
+  it("selects the purchase_apr entry's percentage as Debt.apr, and preserves ALL aprs entries (with subfields) in rawLiabilityDetails", () => {
+    const liability = creditCardLiability({
+      aprs: [
+        { aprType: "cash_apr", aprPercentage: 27.99, balanceSubjectToApr: 100, interestChargeAmount: 5 },
+        { aprType: "purchase_apr", aprPercentage: 18.5, balanceSubjectToApr: 900, interestChargeAmount: 12 },
+        { aprType: "penalty_apr", aprPercentage: 29.99 },
+      ],
+    });
+
+    const mapped = mapPlaidLiabilityToDebt(liability);
+
+    expect(mapped.apr).toBe(18.5);
+    expect(mapped.rawLiabilityDetails?.aprs).toEqual([
+      { aprType: "cash_apr", aprPercentage: 27.99, balanceSubjectToApr: 100, interestChargeAmount: 5 },
+      { aprType: "purchase_apr", aprPercentage: 18.5, balanceSubjectToApr: 900, interestChargeAmount: 12 },
+      { aprType: "penalty_apr", aprPercentage: 29.99, balanceSubjectToApr: null, interestChargeAmount: null },
+    ]);
+  });
+
+  it("is deterministic regardless of array order — Debt.apr never depends on which entry comes first", () => {
+    const first = creditCardLiability({
+      aprs: [
+        { aprType: "purchase_apr", aprPercentage: 18.5 },
+        { aprType: "cash_apr", aprPercentage: 27.99 },
+      ],
+    });
+    const reordered = creditCardLiability({
+      aprs: [
+        { aprType: "cash_apr", aprPercentage: 27.99 },
+        { aprType: "purchase_apr", aprPercentage: 18.5 },
+      ],
+    });
+
+    expect(mapPlaidLiabilityToDebt(first).apr).toBe(18.5);
+    expect(mapPlaidLiabilityToDebt(reordered).apr).toBe(18.5);
+  });
+
+  it("no purchase_apr entry present -> Debt.apr is undefined, never fabricated from another APR type", () => {
+    const liability = creditCardLiability({
+      aprs: [
+        { aprType: "cash_apr", aprPercentage: 27.99 },
+        { aprType: "penalty_apr", aprPercentage: 29.99 },
+      ],
+    });
+
+    expect(mapPlaidLiabilityToDebt(liability).apr).toBeUndefined();
+  });
+});
+
+describe("mapPlaidLiabilityToDebt — mortgage", () => {
+  it("maps apr from interestRatePercentage, nextPaymentDueDate direct, liabilityType mortgage", () => {
+    const mapped = mapPlaidLiabilityToDebt(mortgageLiability());
+    expect(mapped.apr).toBe(6.25);
+    expect(mapped.nextPaymentDueDate).toBe("2026-02-01");
+    expect(mapped.liabilityType).toBe("mortgage");
+  });
+
+  it("isOverdue: positive pastDueAmount -> true", () => {
+    const mapped = mapPlaidLiabilityToDebt(mortgageLiability({ pastDueAmount: 250 }));
+    expect(mapped.isOverdue).toBe(true);
+  });
+
+  it("isOverdue: pastDueAmount of exactly 0 -> false", () => {
+    const mapped = mapPlaidLiabilityToDebt(mortgageLiability({ pastDueAmount: 0 }));
+    expect(mapped.isOverdue).toBe(false);
+  });
+
+  it("isOverdue: pastDueAmount absent -> undefined, never defaulted to false", () => {
+    const mapped = mapPlaidLiabilityToDebt(mortgageLiability());
+    expect(mapped.isOverdue).toBeUndefined();
+  });
+});
+
+describe("mapPlaidLiabilityToDebt — student loan", () => {
+  it("maps apr/minimumPayment/nextPaymentDueDate, liabilityType student_loan", () => {
+    const mapped = mapPlaidLiabilityToDebt(studentLoanLiability());
+    expect(mapped.apr).toBe(4.5);
+    expect(mapped.minimumPayment).toBe(120);
+    expect(mapped.nextPaymentDueDate).toBe("2026-02-15");
+    expect(mapped.liabilityType).toBe("student_loan");
+  });
+});
+
+describe("mapPlaidLiabilityToDebt — missing optional fields", () => {
+  it("a liability with only the required fields maps without throwing and without fabricating apr/minimumPayment/nextPaymentDueDate", () => {
+    const liability: PlaidLiabilityData = {
+      kind: "student_loan",
+      plaidAccountId: "plaid-acct-loan-bare",
+      currentBalance: 1000,
+    };
+    const mapped = mapPlaidLiabilityToDebt(liability);
+    expect(mapped.balance).toBe(1000);
+    expect(mapped.apr).toBeUndefined();
+    expect(mapped.minimumPayment).toBeUndefined();
+    expect(mapped.nextPaymentDueDate).toBeUndefined();
+    expect(mapped.isOverdue).toBeUndefined();
+  });
+});
+
+describe("syncPlaidLiabilities — create-or-update by plaidAccountId, one test per liability kind", () => {
+  it("credit card: re-syncing the same plaidAccountId updates the existing Debt row rather than duplicating", () => {
+    const created = syncPlaidLiabilities([], [creditCardLiability({ currentBalance: 500 })]);
+    expect(created).toHaveLength(1);
+    const id = created[0].id;
+
+    const resynced = syncPlaidLiabilities(created, [creditCardLiability({ currentBalance: 480 })]);
+    expect(resynced).toHaveLength(1);
+    expect(resynced[0].id).toBe(id);
+    expect(resynced[0].balance).toBe(480);
+  });
+
+  it("mortgage: re-syncing the same plaidAccountId updates the existing Debt row rather than duplicating", () => {
+    const created = syncPlaidLiabilities([], [mortgageLiability({ currentBalance: 250000 })]);
+    expect(created).toHaveLength(1);
+    const id = created[0].id;
+
+    const resynced = syncPlaidLiabilities(created, [mortgageLiability({ currentBalance: 248000 })]);
+    expect(resynced).toHaveLength(1);
+    expect(resynced[0].id).toBe(id);
+    expect(resynced[0].balance).toBe(248000);
+  });
+
+  it("student loan: re-syncing the same plaidAccountId updates the existing Debt row rather than duplicating", () => {
+    const created = syncPlaidLiabilities([], [studentLoanLiability({ currentBalance: 15000 })]);
+    expect(created).toHaveLength(1);
+    const id = created[0].id;
+
+    const resynced = syncPlaidLiabilities(created, [studentLoanLiability({ currentBalance: 14500 })]);
+    expect(resynced).toHaveLength(1);
+    expect(resynced[0].id).toBe(id);
+    expect(resynced[0].balance).toBe(14500);
+  });
+});
+
 describe("syncPlaidLiabilities — distinct from spending categorization", () => {
-  it("creates and updates Debt records without touching any Transaction or category", () => {
+  it("creates and updates Debt records (credit card, mortgage, and student loan) without touching any Transaction or category", () => {
     const localDebts: Debt[] = [
       { id: "debt-cc", name: "Credit Card", balance: 1200, apr: 22.99, minimumPayment: 35 },
     ];
@@ -235,21 +426,20 @@ describe("syncPlaidLiabilities — distinct from spending categorization", () =>
     const transactionsSnapshot = [...localTransactions];
 
     const liabilities: PlaidLiabilityData[] = [
-      { plaidLiabilityId: "plaid-liability-1", currentBalance: 500, apr: 18.5, minimumPaymentAmount: 25, accountName: "Store Card" },
+      creditCardLiability(),
+      mortgageLiability(),
+      studentLoanLiability(),
     ];
 
     const updatedDebts = syncPlaidLiabilities(localDebts, liabilities);
 
-    expect(updatedDebts).toHaveLength(2);
-    const newDebt = updatedDebts.find((d) => d.plaidLiabilityId === "plaid-liability-1");
-    expect(newDebt).toMatchObject({ balance: 500, apr: 18.5, minimumPayment: 25, name: "Store Card" });
-
-    // Re-sync updates the same row rather than duplicating it.
-    const resynced = syncPlaidLiabilities(updatedDebts, [
-      { ...liabilities[0], currentBalance: 480 },
-    ]);
-    expect(resynced).toHaveLength(2);
-    expect(resynced.find((d) => d.plaidLiabilityId === "plaid-liability-1")?.balance).toBe(480);
+    expect(updatedDebts).toHaveLength(4);
+    const cc = updatedDebts.find((d) => d.plaidAccountId === "plaid-acct-cc-1");
+    expect(cc).toMatchObject({ balance: 500, apr: 18.5, name: "Store Card", liabilityType: "credit_card" });
+    const mortgage = updatedDebts.find((d) => d.plaidAccountId === "plaid-acct-mortgage-1");
+    expect(mortgage).toMatchObject({ balance: 250000, apr: 6.25, liabilityType: "mortgage" });
+    const loan = updatedDebts.find((d) => d.plaidAccountId === "plaid-acct-loan-1");
+    expect(loan).toMatchObject({ balance: 15000, apr: 4.5, minimumPayment: 120, liabilityType: "student_loan" });
 
     // Never touched transactions.
     expect(localTransactions).toEqual(transactionsSnapshot);

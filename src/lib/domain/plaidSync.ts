@@ -250,20 +250,83 @@ export function syncPlaidAccounts(
   return result;
 }
 
-export function mapPlaidLiabilityToDebt(
-  liability: PlaidLiabilityData
-): Pick<Debt, "balance" | "apr" | "minimumPayment" | "plaidLiabilityId"> {
-  return {
-    balance: liability.currentBalance,
-    apr: liability.apr,
-    minimumPayment: liability.minimumPaymentAmount,
-    plaidLiabilityId: liability.plaidLiabilityId,
-  };
+type MappedDebtFields = Pick<
+  Debt,
+  "balance" | "apr" | "minimumPayment" | "plaidAccountId" | "liabilityType" | "nextPaymentDueDate" | "isOverdue" | "rawLiabilityDetails"
+>;
+
+/**
+ * Maps one Plaid liability into this app's Debt shape, by kind:
+ *  - credit_card: Debt.apr is the entry whose aprType === "purchase_apr",
+ *    if any — never the first array entry, never any other APR type. No
+ *    purchase APR present leaves Debt.apr undefined (never fabricated
+ *    from cash/balance-transfer/penalty/promotional APRs). The complete
+ *    aprs array (all four fields per entry) is preserved verbatim in
+ *    rawLiabilityDetails.aprs.
+ *  - mortgage: apr comes from interestRatePercentage. isOverdue is
+ *    derived from pastDueAmount (> 0), staying undefined when
+ *    pastDueAmount itself is undefined — never defaulted to false, since
+ *    that would silently assert "not overdue" about something unknown.
+ *  - student_loan: apr/minimumPayment/nextPaymentDueDate/isOverdue map
+ *    directly from Plaid's own fields.
+ * Missing optional Plaid fields stay undefined throughout — never
+ * defaulted to 0 or invented.
+ */
+export function mapPlaidLiabilityToDebt(liability: PlaidLiabilityData): MappedDebtFields {
+  switch (liability.kind) {
+    case "credit_card": {
+      const purchaseApr = liability.aprs.find((entry) => entry.aprType === "purchase_apr");
+      return {
+        balance: liability.currentBalance,
+        apr: purchaseApr?.aprPercentage,
+        minimumPayment: liability.minimumPaymentAmount,
+        plaidAccountId: liability.plaidAccountId,
+        liabilityType: "credit_card",
+        isOverdue: liability.isOverdue,
+        rawLiabilityDetails: {
+          aprs: liability.aprs.map((entry) => ({
+            aprType: entry.aprType,
+            aprPercentage: entry.aprPercentage,
+            balanceSubjectToApr: entry.balanceSubjectToApr ?? null,
+            interestChargeAmount: entry.interestChargeAmount ?? null,
+          })),
+          lastPaymentAmount: liability.lastPaymentAmount ?? null,
+          lastPaymentDate: liability.lastPaymentDate ?? null,
+        },
+      };
+    }
+    case "mortgage": {
+      const isOverdue = liability.pastDueAmount !== undefined ? liability.pastDueAmount > 0 : undefined;
+      return {
+        balance: liability.currentBalance,
+        apr: liability.interestRatePercentage,
+        plaidAccountId: liability.plaidAccountId,
+        liabilityType: "mortgage",
+        nextPaymentDueDate: liability.nextPaymentDueDate,
+        isOverdue,
+      };
+    }
+    case "student_loan": {
+      return {
+        balance: liability.currentBalance,
+        apr: liability.interestRatePercentage,
+        minimumPayment: liability.minimumPaymentAmount,
+        plaidAccountId: liability.plaidAccountId,
+        liabilityType: "student_loan",
+        nextPaymentDueDate: liability.nextPaymentDueDate,
+        isOverdue: liability.isOverdue,
+      };
+    }
+  }
 }
 
-/** Create-or-update Debt records by plaidLiabilityId. Completely
- * separate from the transaction/category path above — proven by test
- * to never touch transactions or categories. */
+/** Create-or-update Debt records by plaidAccountId — Plaid's real,
+ * stable liability identity (there is no separate provider
+ * liability_id). Every liability this function sees already has a
+ * non-null plaidAccountId; the null-account_id case is filtered out one
+ * layer up, in syncAdapters.ts's mapLiabilitiesResponseToLiabilityData.
+ * Completely separate from the transaction/category path above — proven
+ * by test to never touch transactions or categories. */
 export function syncPlaidLiabilities(
   localDebts: Debt[],
   liabilities: PlaidLiabilityData[]
@@ -273,13 +336,13 @@ export function syncPlaidLiabilities(
   for (const liability of liabilities) {
     const mapped = mapPlaidLiabilityToDebt(liability);
     const existingIndex = result.findIndex(
-      (d) => d.plaidLiabilityId === liability.plaidLiabilityId
+      (d) => d.plaidAccountId === liability.plaidAccountId
     );
     if (existingIndex >= 0) {
       result[existingIndex] = { ...result[existingIndex], ...mapped };
     } else {
       result.push({
-        id: `debt-plaid-${liability.plaidLiabilityId}`,
+        id: `debt-plaid-${liability.plaidAccountId}`,
         name: liability.accountName ?? "Linked Account",
         ...mapped,
       });

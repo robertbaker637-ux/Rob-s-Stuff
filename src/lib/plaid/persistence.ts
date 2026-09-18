@@ -68,7 +68,11 @@ function toDebtRow(userId: string, d: Debt) {
     balance: d.balance,
     apr: d.apr ?? null,
     minimum_payment: d.minimumPayment ?? null,
-    plaid_liability_id: d.plaidLiabilityId ?? null,
+    plaid_account_id: d.plaidAccountId ?? null,
+    liability_type: d.liabilityType ?? null,
+    next_payment_due_date: d.nextPaymentDueDate ?? null,
+    is_overdue: d.isOverdue ?? null,
+    raw_liability_details: d.rawLiabilityDetails ?? null,
   };
 }
 

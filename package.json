@@ -1,6 +1,6 @@
 {
   "name": "baseline",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -12,6 +12,7 @@
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
     "@supabase/supabase-js": "^2.45.4",
+    "jose": "^6.2.12",
     "next": "^14.2.15",
     "plaid": "^47.0.0",
     "react": "^18.3.1",
