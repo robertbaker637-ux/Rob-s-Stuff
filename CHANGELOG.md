@@ -1,5 +1,57 @@
 # BASELINE Changelog
 
+## v2 rv2.3 — 2026-09-18
+
+Step 4 of the build sequence: the transaction model. Local/seeded data
+only — no Plaid integration yet (that's Step 5). Canonical-window
+computation, income projection/reconciliation, category-budget
+allocation, and the sweep formula are unchanged — every rv2.1/rv2.2 test
+still passes verbatim (62 tests total now, 28 new).
+
+- **Raw/normalized field separation.** `Transaction` now carries
+  `rawDescription`/`rawMerchantName`/`rawCategory`/`rawAmount`/`rawDate`
+  (immutable once set) separately from `categoryId`/`normalizedMerchantName`
+  (what corrections change). Canonical-window assignment continues to
+  read `postedDate` only — `rawDate` has no influence on it, proven by a
+  new regression test.
+- **Merchant normalization + memory** (`src/lib/domain/merchantMemory.ts`).
+  `normalizeMerchantKey` + `applyMerchantMemory` auto-categorize a
+  transaction from a `MerchantRule` matched on its raw merchant identity.
+  `correctTransactionCategory` re-teaches one merchant without touching
+  other merchants' rules or other transactions' past records. The rule
+  lookup key is always derived from raw fields — `normalizedMerchantName`
+  is display-only and can never change which rule applies.
+- **Split transactions** (`src/lib/domain/transactionSplits.ts`).
+  `validateSplitAllocations` enforces splits summing exactly to the
+  parent amount. `computeSplitAwareCategoryBalanceForWindow` is a new,
+  additive function — `categoryAllocation.ts`'s existing single-category
+  functions are untouched, and a non-split transaction is proven to
+  produce byte-identical results through either path.
+- **Confidence-based transfer detection** (`src/lib/domain/transferDetection.ts`).
+  `scoreTransferCandidate` enforces its own candidacy prerequisites
+  (different accounts, opposite directions) before scoring, so no caller
+  can bypass them. Exact-amount/same-day pairs score high (auto-link
+  eligible via `confirmTransferLink`); near-amount/nearby-date pairs
+  score low (need one-tap confirmation); a confirmed account pair's
+  history raises the confidence of future matches on that same pair.
+  Linked transfers stay excluded from category totals via the existing
+  `isTransfer` filter, unchanged.
+- **Bill linking field.** `Transaction.billId` added for a manual link to
+  a Bill/Subscription record. Auto-matching by amount+date+merchant is
+  explicitly Step 7, not built here.
+- Supabase migration amended in place: `transactions` extended, plus new
+  `transaction_splits`, `merchant_rules`, and `transfer_pair_history`
+  tables (still nothing deployed to a live project).
+- Seed fixture extended additively (`txn-9` onward) with one
+  merchant-memory example, one split transaction, one confirmed transfer
+  pair, and one unconfirmed transfer candidate — `txn-1`..`txn-8` and
+  every existing paycheck/bill are byte-identical to rv2.2.
+
+No new UI page this pass (Dashboard/Budget don't need transaction-level
+detail to keep working) — validated entirely through the test suite and
+the extended seed fixture, same as rv2.2's reconciliation logic was
+before any UI touched it.
+
 ## v2 rv2.2 — 2026-09-16
 
 Correction/validation pass following a manual review of rv2.1's seeded

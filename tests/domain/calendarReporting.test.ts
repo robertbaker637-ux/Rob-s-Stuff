@@ -45,6 +45,10 @@ describe("prorateWindowAcrossMonths", () => {
         description: "Groceries",
         categoryId: "cat-groceries",
         isTransfer: false,
+        rawDescription: "Groceries",
+        rawAmount: 20,
+        rawDate: "2026-09-03",
+        needsReview: false,
       },
     ]);
 
@@ -60,6 +64,10 @@ describe("prorateWindowAcrossMonths", () => {
         description: "Groceries",
         categoryId: "cat-groceries",
         isTransfer: false,
+        rawDescription: "Groceries",
+        rawAmount: 20,
+        rawDate: "2026-09-03",
+        needsReview: false,
       },
     ]);
 

@@ -10,10 +10,13 @@ import {
   seedCategoryWindowBudgets,
   seedDebts,
   seedIncomeSources,
+  seedMerchantRules,
   seedPaySchedules,
   seedPaychecks,
   seedSinkingFunds,
+  seedTransactionSplits,
   seedTransactions,
+  seedTransferPairHistory,
 } from "./seed";
 
 export const seedRepository: Repository = {
@@ -61,5 +64,14 @@ export const seedRepository: Repository = {
   },
   async getTransactions() {
     return seedTransactions;
+  },
+  async getTransactionSplits() {
+    return seedTransactionSplits;
+  },
+  async getMerchantRules() {
+    return seedMerchantRules;
+  },
+  async getTransferPairHistory() {
+    return seedTransferPairHistory;
   },
 };

@@ -1,4 +1,4 @@
-// Manually-seeded household fixture (rv2.1, extended in rv2.2).
+// Manually-seeded household fixture (rv2.1, extended in rv2.2 and rv2.3).
 //
 // Enough hand-entered data to validate the domain math end to end and to
 // drive the UI shell before any real Plaid/Supabase connection exists.
@@ -16,8 +16,19 @@
 // reconcilePaycheck — including one that lands in a different canonical
 // window than it was originally projected into (Church's Jan 11
 // projection, actually deposited Jan 17).
+//
+// rv2.3 (Step 4, transaction model): txn-1..txn-8 are UNCHANGED in
+// behavior — only the new required raw_*/needsReview fields were added
+// mechanically (raw mirrors normalized, since these were entered as
+// already-reviewed). Everything from txn-9 onward is new: a
+// merchant-memory example (generated via applyMerchantMemory, not
+// hand-categorized), a split transaction, and a confirmed + an
+// unconfirmed transfer-detection pair, so all four Step 4 behaviors are
+// visible in the fixture, not just in isolated unit tests.
 
 import { projectExpectedPaychecks, reconcilePaycheck } from "@/lib/domain/paycheck";
+import { applyMerchantMemory, normalizeMerchantKey } from "@/lib/domain/merchantMemory";
+import { confirmTransferLink } from "@/lib/domain/transferDetection";
 import type {
   Account,
   Bill,
@@ -25,10 +36,13 @@ import type {
   CategoryWindowBudget,
   Debt,
   IncomeSource,
+  MerchantRule,
   Paycheck,
   PaySchedule,
   SinkingFund,
   Transaction,
+  TransactionSplit,
+  TransferPairHistory,
 } from "@/lib/domain/types";
 
 export const seedAccounts: Account[] = [
@@ -152,12 +166,15 @@ export const seedCategories: Category[] = [
   { id: "cat-groceries", name: "Groceries", rolloverMode: "rollover", isIncomeCategory: false },
   { id: "cat-utilities", name: "Utilities", rolloverMode: "rollover", isIncomeCategory: false },
   { id: "cat-fun", name: "Fun Money", rolloverMode: "sweep", isIncomeCategory: false },
+  // Added in rv2.3 as the second leg of the split-transaction example below.
+  { id: "cat-household", name: "Household", rolloverMode: "rollover", isIncomeCategory: false },
 ];
 
 export const seedCategoryWindowBudgets: CategoryWindowBudget[] = [
   { id: "b-groceries", categoryId: "cat-groceries", amount: 150, effectiveFrom: "2025-01-01" },
   { id: "b-utilities", categoryId: "cat-utilities", amount: 50, effectiveFrom: "2025-01-01" },
   { id: "b-fun", categoryId: "cat-fun", amount: 40, effectiveFrom: "2025-01-01" },
+  { id: "b-household", categoryId: "cat-household", amount: 60, effectiveFrom: "2025-01-01" },
 ];
 
 export const seedBills: Bill[] = [
@@ -194,20 +211,154 @@ export const seedDebts: Debt[] = [
   { id: "debt-cc", name: "Credit Card", balance: 1200, apr: 22.99, minimumPayment: 35 },
 ];
 
+// txn-1..txn-8: UNCHANGED behavior from rv2.1/rv2.2 — amount, postedDate,
+// categoryId, isTransfer are byte-for-byte identical. Only the new
+// required raw_*/needsReview fields were added mechanically (raw mirrors
+// normalized, since these were entered as already-reviewed, pre-Plaid).
 export const seedTransactions: Transaction[] = [
   // Window 1 (Jan 2-16)
-  { id: "txn-1", accountId: "acct-checking", postedDate: "2026-01-06", pending: false, amount: 45, description: "Grocery Mart", categoryId: "cat-groceries", isTransfer: false },
-  { id: "txn-2", accountId: "acct-checking", postedDate: "2026-01-10", pending: false, amount: 30, description: "Corner Grocer", categoryId: "cat-groceries", isTransfer: false },
-  { id: "txn-3", accountId: "acct-checking", postedDate: "2026-01-09", pending: false, amount: 50, description: "Electric Co.", categoryId: "cat-utilities", isTransfer: false },
+  { id: "txn-1", accountId: "acct-checking", postedDate: "2026-01-06", pending: false, amount: 45, description: "Grocery Mart", categoryId: "cat-groceries", isTransfer: false, rawDescription: "Grocery Mart", rawAmount: 45, rawDate: "2026-01-06", needsReview: false },
+  { id: "txn-2", accountId: "acct-checking", postedDate: "2026-01-10", pending: false, amount: 30, description: "Corner Grocer", categoryId: "cat-groceries", isTransfer: false, rawDescription: "Corner Grocer", rawAmount: 30, rawDate: "2026-01-10", needsReview: false },
+  { id: "txn-3", accountId: "acct-checking", postedDate: "2026-01-09", pending: false, amount: 50, description: "Electric Co.", categoryId: "cat-utilities", isTransfer: false, rawDescription: "Electric Co.", rawAmount: 50, rawDate: "2026-01-09", needsReview: false },
 
   // Window 2 (Jan 16-30)
-  { id: "txn-4", accountId: "acct-checking", postedDate: "2026-01-18", pending: false, amount: 35, description: "Grocery Mart", categoryId: "cat-groceries", isTransfer: false },
-  { id: "txn-5", accountId: "acct-checking", postedDate: "2026-01-19", pending: false, amount: 48, description: "Electric Co.", categoryId: "cat-utilities", isTransfer: false },
+  { id: "txn-4", accountId: "acct-checking", postedDate: "2026-01-18", pending: false, amount: 35, description: "Grocery Mart", categoryId: "cat-groceries", isTransfer: false, rawDescription: "Grocery Mart", rawAmount: 35, rawDate: "2026-01-18", needsReview: false },
+  { id: "txn-5", accountId: "acct-checking", postedDate: "2026-01-19", pending: false, amount: 48, description: "Electric Co.", categoryId: "cat-utilities", isTransfer: false, rawDescription: "Electric Co.", rawAmount: 48, rawDate: "2026-01-19", needsReview: false },
 
   // Window 3 (Jan 30 - Feb 13) — real spending on both sides of the Jan/Feb
   // boundary, inside the SAME canonical window. See
   // categoryAllocation.test.ts for the balance-carry assertion this backs.
-  { id: "txn-6", accountId: "acct-checking", postedDate: "2026-01-31", pending: false, amount: 40, description: "Grocery Mart", categoryId: "cat-groceries", isTransfer: false },
-  { id: "txn-7", accountId: "acct-checking", postedDate: "2026-02-03", pending: false, amount: 30, description: "Corner Grocer", categoryId: "cat-groceries", isTransfer: false },
-  { id: "txn-8", accountId: "acct-checking", postedDate: "2026-02-04", pending: true, amount: 52, description: "Electric Co.", categoryId: "cat-utilities", isTransfer: false },
+  { id: "txn-6", accountId: "acct-checking", postedDate: "2026-01-31", pending: false, amount: 40, description: "Grocery Mart", categoryId: "cat-groceries", isTransfer: false, rawDescription: "Grocery Mart", rawAmount: 40, rawDate: "2026-01-31", needsReview: false },
+  { id: "txn-7", accountId: "acct-checking", postedDate: "2026-02-03", pending: false, amount: 30, description: "Corner Grocer", categoryId: "cat-groceries", isTransfer: false, rawDescription: "Corner Grocer", rawAmount: 30, rawDate: "2026-02-03", needsReview: false },
+  { id: "txn-8", accountId: "acct-checking", postedDate: "2026-02-04", pending: true, amount: 52, description: "Electric Co.", categoryId: "cat-utilities", isTransfer: false, rawDescription: "Electric Co.", rawAmount: 52, rawDate: "2026-02-04", needsReview: false },
 ];
+
+// ============================================================================
+// rv2.3 (Step 4) — merchant memory, split transactions, transfer detection
+// ============================================================================
+
+export const seedMerchantRules: MerchantRule[] = [
+  { id: "rule-coffee-house", merchantKey: normalizeMerchantKey("Coffee House"), categoryId: "cat-fun" },
+];
+
+// Generated via applyMerchantMemory against seedMerchantRules above, not
+// hand-categorized — this is the merchant-memory auto-categorization path
+// actually exercised, not just described.
+const coffeeHouseRaw: Transaction = {
+  id: "txn-9",
+  accountId: "acct-checking",
+  postedDate: "2026-01-07",
+  pending: false,
+  amount: 6.5,
+  description: "Coffee House",
+  isTransfer: false,
+  rawDescription: "Coffee House",
+  rawMerchantName: "Coffee House",
+  rawAmount: 6.5,
+  rawDate: "2026-01-07",
+  needsReview: true,
+};
+export const seedCoffeeHouseTransaction: Transaction = applyMerchantMemory(
+  coffeeHouseRaw,
+  seedMerchantRules
+);
+
+// A split transaction: one Target run divided across Groceries and
+// Household. No top-level categoryId — its category is entirely defined
+// by seedTransactionSplits below (see getEffectiveCategoryLineItems).
+export const seedSplitTransaction: Transaction = {
+  id: "txn-10",
+  accountId: "acct-checking",
+  postedDate: "2026-01-20",
+  pending: false,
+  amount: 90,
+  description: "Target",
+  isTransfer: false,
+  rawDescription: "Target",
+  rawAmount: 90,
+  rawDate: "2026-01-20",
+  needsReview: false,
+};
+export const seedTransactionSplits: TransactionSplit[] = [
+  { id: "split-10-groceries", transactionId: "txn-10", categoryId: "cat-groceries", amount: 50 },
+  { id: "split-10-household", transactionId: "txn-10", categoryId: "cat-household", amount: 40 },
+];
+
+// A confirmed, high-confidence transfer pair (exact amount, same day,
+// checking -> savings) — run through confirmTransferLink so the fixture
+// carries real linked/history state, not a hand-set transferLinkId.
+const transferLegARaw: Transaction = {
+  id: "txn-11",
+  accountId: "acct-checking",
+  postedDate: "2026-01-21",
+  pending: false,
+  amount: 200, // outflow
+  description: "Transfer to Savings",
+  isTransfer: false,
+  rawDescription: "Transfer to Savings",
+  rawAmount: 200,
+  rawDate: "2026-01-21",
+  needsReview: false,
+};
+const transferLegBRaw: Transaction = {
+  id: "txn-12",
+  accountId: "acct-savings",
+  postedDate: "2026-01-21",
+  pending: false,
+  amount: -200, // inflow
+  description: "Transfer from Checking",
+  isTransfer: false,
+  rawDescription: "Transfer from Checking",
+  rawAmount: -200,
+  rawDate: "2026-01-21",
+  needsReview: false,
+};
+export const {
+  txnA: seedConfirmedTransferLegA,
+  txnB: seedConfirmedTransferLegB,
+  pairHistory: seedTransferPairHistory,
+}: { txnA: Transaction; txnB: Transaction; pairHistory: TransferPairHistory[] } = confirmTransferLink(
+  transferLegARaw,
+  transferLegBRaw,
+  []
+);
+
+// An UNCONFIRMED, low-confidence candidate pair (near amount, a few days
+// apart, on a different account pair with no prior history) — left
+// exactly as findTransferCandidates/scoreTransferCandidate would surface
+// it, still needing a one-tap confirmation. isTransfer stays false.
+export const seedTransferCandidateLegA: Transaction = {
+  id: "txn-13",
+  accountId: "acct-checking",
+  postedDate: "2026-01-22",
+  pending: false,
+  amount: 75,
+  description: "Possible Transfer",
+  isTransfer: false,
+  rawDescription: "Possible Transfer",
+  rawAmount: 75,
+  rawDate: "2026-01-22",
+  needsReview: true,
+};
+export const seedTransferCandidateLegB: Transaction = {
+  id: "txn-14",
+  accountId: "acct-hsa",
+  postedDate: "2026-01-24",
+  pending: false,
+  amount: -74,
+  description: "Possible Transfer In",
+  isTransfer: false,
+  rawDescription: "Possible Transfer In",
+  rawAmount: -74,
+  rawDate: "2026-01-24",
+  needsReview: true,
+};
+
+seedTransactions.push(
+  seedCoffeeHouseTransaction,
+  seedSplitTransaction,
+  seedConfirmedTransferLegA,
+  seedConfirmedTransferLegB,
+  seedTransferCandidateLegA,
+  seedTransferCandidateLegB
+);

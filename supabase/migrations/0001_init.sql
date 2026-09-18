@@ -1,5 +1,7 @@
 -- BASELINE v2 rv2.1 — initial schema (paychecks/income_sources amended in
--- rv2.2 for projected/actual reconciliation — see CHANGELOG v2 rv2.2).
+-- rv2.2 for projected/actual reconciliation; transactions extended and
+-- transaction_splits/merchant_rules/transfer_pair_history added in rv2.3
+-- for the Step 4 transaction model — see CHANGELOG v2 rv2.3).
 --
 -- Core entities for build-sequence steps 1-3: accounts, income sources /
 -- pay schedules, paychecks, categories / category window budgets, bills,
@@ -332,9 +334,13 @@ create policy "debts_all_own" on debts
 create index debts_user_id_idx on debts (user_id);
 
 -- ============================================================================
--- transactions (minimal baseline — see rv2.1 plan for what's deferred)
+-- transactions (extended in rv2.3 for the Step 4 transaction model)
 -- ============================================================================
 
+-- Raw source fields (raw_*) are set once at creation and never
+-- overwritten by any correction — see src/lib/domain/merchantMemory.ts.
+-- Pre-Plaid, raw_merchant_name/raw_category are typically null since
+-- there's no external enrichment to diverge from yet.
 create table transactions (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
@@ -345,6 +351,19 @@ create table transactions (
   description text not null,
   category_id uuid references categories (id) on delete set null,
   is_transfer boolean not null default false,
+
+  raw_description text not null,
+  raw_merchant_name text,
+  raw_category text,
+  raw_amount numeric(12, 2) not null,
+  raw_date date not null,
+
+  normalized_merchant_name text,
+  needs_review boolean not null default true,
+
+  bill_id uuid references bills (id) on delete set null,
+  transfer_link_id uuid,
+
   created_at timestamptz not null default now()
 );
 
@@ -356,8 +375,101 @@ create policy "transactions_all_own" on transactions
 create index transactions_user_id_idx on transactions (user_id);
 create index transactions_account_id_idx on transactions (account_id);
 create index transactions_posted_date_idx on transactions (posted_date);
+create index transactions_bill_id_idx on transactions (bill_id);
+create index transactions_transfer_link_id_idx on transactions (transfer_link_id);
 
 -- Canonical-window assignment for a transaction is computed from
 -- posted_date via assignDateToCanonicalWindow (see
 -- src/lib/domain/payWindow.ts) — a second reporting dimension on the same
--- row, not a stored column and not a duplicated record.
+-- row, not a stored column and not a duplicated record. raw_date is a
+-- separate, independent field that nothing in the window/budget domain
+-- layer reads.
+
+-- ============================================================================
+-- transaction_splits
+-- ============================================================================
+
+-- A transaction with splits has one or more of these; their amounts must
+-- sum exactly to the parent transaction's amount (enforced by
+-- validateSplitAllocations in src/lib/domain/transactionSplits.ts, not a
+-- DB constraint, since a partial edit mid-flow can transiently not sum
+-- yet — the app validates before persisting).
+create table transaction_splits (
+  id uuid primary key default gen_random_uuid(),
+  transaction_id uuid not null references transactions (id) on delete cascade,
+  category_id uuid not null references categories (id) on delete cascade,
+  amount numeric(12, 2) not null,
+  created_at timestamptz not null default now()
+);
+
+alter table transaction_splits enable row level security;
+
+create policy "transaction_splits_all_own" on transaction_splits
+  for all using (
+    exists (
+      select 1 from transactions t
+      where t.id = transaction_splits.transaction_id and t.user_id = auth.uid()
+    )
+  )
+  with check (
+    exists (
+      select 1 from transactions t
+      where t.id = transaction_splits.transaction_id and t.user_id = auth.uid()
+    )
+  );
+
+create index transaction_splits_transaction_id_idx on transaction_splits (transaction_id);
+
+-- ============================================================================
+-- merchant_rules
+-- ============================================================================
+
+-- One row per normalized merchant identity. merchant_key is always
+-- derived from a transaction's RAW fields (see
+-- getTransactionMerchantKey in src/lib/domain/merchantMemory.ts) — never
+-- from normalized_merchant_name, so renaming how a merchant displays can
+-- never change which rule applies.
+create table merchant_rules (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  merchant_key text not null,
+  category_id uuid not null references categories (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (user_id, merchant_key)
+);
+
+alter table merchant_rules enable row level security;
+
+create policy "merchant_rules_all_own" on merchant_rules
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create index merchant_rules_user_id_idx on merchant_rules (user_id);
+
+-- ============================================================================
+-- transfer_pair_history
+-- ============================================================================
+
+-- Confirmed-transfer history for one unordered pair of accounts.
+-- account_a_id/account_b_id are always stored in sorted order (see
+-- canonicalAccountPairKey in src/lib/domain/transferDetection.ts) so a
+-- pair is looked up the same way regardless of which account a given
+-- transaction happens to be on. Growing confirmed_count is what lets
+-- scoreTransferCandidate raise confidence on that pair over time.
+create table transfer_pair_history (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  account_a_id uuid not null references accounts (id) on delete cascade,
+  account_b_id uuid not null references accounts (id) on delete cascade,
+  confirmed_count integer not null default 0,
+  created_at timestamptz not null default now(),
+  unique (user_id, account_a_id, account_b_id),
+  constraint account_pair_is_sorted check (account_a_id < account_b_id)
+);
+
+alter table transfer_pair_history enable row level security;
+
+create policy "transfer_pair_history_all_own" on transfer_pair_history
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create index transfer_pair_history_user_id_idx on transfer_pair_history (user_id);

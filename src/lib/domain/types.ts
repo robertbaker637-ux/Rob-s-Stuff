@@ -132,15 +132,88 @@ export interface Debt {
   minimumPayment?: number;
 }
 
+/**
+ * A transaction's raw source fields are set once at creation and NEVER
+ * overwritten by any later correction (merchant re-teaching, category
+ * fix, etc.) — they're what "the source actually said," preserved
+ * separately from whatever normalization/correction happens afterward.
+ * Pre-Plaid, rawMerchantName/rawCategory are typically unset since
+ * there's no external enrichment to diverge from yet; Step 5 (Plaid)
+ * populates them.
+ */
 export interface Transaction {
   id: string;
   accountId: string;
+  /** Operative date for canonical-window assignment (see payWindow.ts)
+   * and calendar reporting. Distinct from rawDate below — nothing in the
+   * window/budget domain layer reads rawDate. */
   postedDate: IsoDate;
   pending: boolean;
   amount: number;
   description: string;
   categoryId?: string;
   isTransfer: boolean;
+
+  // Raw source fields — immutable once set.
+  rawDescription: string;
+  rawMerchantName?: string;
+  rawCategory?: string;
+  rawAmount: number;
+  rawDate: IsoDate;
+
+  // Normalized/user-corrected fields — these are what change.
+  /** Resolved merchant identity for display and merchant-memory matching
+   * output. Never an input to rule lookup — see merchantMemory.ts. */
+  normalizedMerchantName?: string;
+  /** True when no merchant rule matched at categorization time. */
+  needsReview: boolean;
+
+  /** Manual link to a Bill/Subscription record. Auto-matching is Step 7 —
+   * this pass only adds the field + a manual linking helper. */
+  billId?: string;
+  /** Shared id pairing this transaction with its other leg once
+   * confirmed as an internal transfer. See transferDetection.ts. */
+  transferLinkId?: string;
+}
+
+/** One category's share of a split transaction. A transaction with splits
+ * has one or more of these, whose amounts must sum exactly to the parent
+ * transaction's amount (see transactionSplits.ts). */
+export interface TransactionSplit {
+  id: string;
+  transactionId: string;
+  categoryId: string;
+  amount: number;
+}
+
+/** One row per normalized merchant identity, mapping it to the category
+ * the user confirmed. merchantKey is always derived from a transaction's
+ * raw fields (see merchantMemory.ts) — never from normalizedMerchantName,
+ * so renaming a merchant's display never changes which rule applies. */
+export interface MerchantRule {
+  id: string;
+  merchantKey: string;
+  categoryId: string;
+}
+
+/** Confirmed-transfer history for one unordered pair of accounts, keyed
+ * via canonicalAccountPairKey so lookup doesn't depend on argument order.
+ * Growing confirmedCount is what lets future matches on the same pair
+ * gain confidence over time (see transferDetection.ts). */
+export interface TransferPairHistory {
+  id: string;
+  accountAId: string;
+  accountBId: string;
+  confirmedCount: number;
+}
+
+export type TransferConfidence = "high" | "low" | "none";
+
+export interface TransferCandidate {
+  transactionAId: string;
+  transactionBId: string;
+  confidence: TransferConfidence;
+  score: number;
 }
 
 /** A canonical operating window: Window N = [start, end), inclusive start,

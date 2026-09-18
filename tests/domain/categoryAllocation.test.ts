@@ -56,6 +56,10 @@ describe("filterTransactionsForCategoryWindow + computeCategoryBalanceForWindow"
         description: "Grocery run before month end",
         categoryId: "cat-groceries",
         isTransfer: false,
+        rawDescription: "Grocery run before month end",
+        rawAmount: 20,
+        rawDate: "2026-01-31",
+        needsReview: false,
       },
       {
         id: "t2",
@@ -66,6 +70,10 @@ describe("filterTransactionsForCategoryWindow + computeCategoryBalanceForWindow"
         description: "Grocery run after month started",
         categoryId: "cat-groceries",
         isTransfer: false,
+        rawDescription: "Grocery run after month started",
+        rawAmount: 30,
+        rawDate: "2026-02-03",
+        needsReview: false,
       },
       {
         id: "t3",
@@ -76,6 +84,10 @@ describe("filterTransactionsForCategoryWindow + computeCategoryBalanceForWindow"
         description: "Belongs to the next window entirely — must not leak in",
         categoryId: "cat-groceries",
         isTransfer: false,
+        rawDescription: "Belongs to the next window entirely — must not leak in",
+        rawAmount: 999,
+        rawDate: "2026-02-20",
+        needsReview: false,
       },
     ];
 
@@ -142,6 +154,10 @@ describe("filterTransactionsForCategoryWindow + computeCategoryBalanceForWindow"
         description: "Checking -> Savings",
         categoryId: "cat-groceries",
         isTransfer: true,
+        rawDescription: "Checking -> Savings",
+        rawAmount: 500,
+        rawDate: "2026-01-05",
+        needsReview: false,
       },
     ];
     const inWindow = filterTransactionsForCategoryWindow(
@@ -151,5 +167,44 @@ describe("filterTransactionsForCategoryWindow + computeCategoryBalanceForWindow"
       ckSchedule
     );
     expect(inWindow).toHaveLength(0);
+  });
+
+  it("canonical-window assignment derives from postedDate only — rawDate never influences it (rv2.3)", () => {
+    // postedDate resolves to W3 (Jan 30 - Feb 13). rawDate is set to a
+    // date that would resolve to a completely different window (W4,
+    // Feb 13-27) if it were mistakenly used instead — it must not be.
+    const window = { start: "2026-01-30", end: "2026-02-13" };
+    const txn: Transaction = {
+      id: "t-raw-vs-posted",
+      accountId: "acct-1",
+      postedDate: "2026-01-31",
+      pending: false,
+      amount: 25,
+      description: "Corrected posted date after a Plaid re-post",
+      categoryId: "cat-groceries",
+      isTransfer: false,
+      rawDescription: "Corrected posted date after a Plaid re-post",
+      rawAmount: 25,
+      rawDate: "2026-02-20", // deliberately in a different canonical window
+      needsReview: false,
+    };
+
+    const inWindow = filterTransactionsForCategoryWindow(
+      [txn],
+      "cat-groceries",
+      window,
+      ckSchedule
+    );
+    expect(inWindow.map((t) => t.id)).toEqual(["t-raw-vs-posted"]);
+
+    // And it must NOT show up in the window rawDate would imply instead.
+    const wrongWindow = { start: "2026-02-13", end: "2026-02-27" };
+    const inWrongWindow = filterTransactionsForCategoryWindow(
+      [txn],
+      "cat-groceries",
+      wrongWindow,
+      ckSchedule
+    );
+    expect(inWrongWindow).toHaveLength(0);
   });
 });

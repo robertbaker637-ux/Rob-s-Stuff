@@ -13,10 +13,13 @@ import type {
   CategoryWindowBudget,
   Debt,
   IncomeSource,
+  MerchantRule,
   Paycheck,
   PaySchedule,
   SinkingFund,
   Transaction,
+  TransactionSplit,
+  TransferPairHistory,
 } from "@/lib/domain/types";
 
 export interface Repository {
@@ -34,4 +37,7 @@ export interface Repository {
   getSinkingFunds(): Promise<SinkingFund[]>;
   getDebts(): Promise<Debt[]>;
   getTransactions(): Promise<Transaction[]>;
+  getTransactionSplits(): Promise<TransactionSplit[]>;
+  getMerchantRules(): Promise<MerchantRule[]>;
+  getTransferPairHistory(): Promise<TransferPairHistory[]>;
 }
