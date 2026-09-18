@@ -12,6 +12,7 @@ export type AccountRole =
   | "savings"
   | "hsa"
   | "credit_card"
+  | "loan"
   | "business"
   | "other_manual";
 
@@ -212,6 +213,26 @@ export interface Transaction {
    * pointing back at the pending transaction_id it replaces. Only
    * meaningful transiently, during sync — see plaidSync.ts. */
   plaidPendingTransactionId?: string;
+
+  /** ISO 8601 timestamp: when BASELINE first learned this transaction
+   * exists AT ALL (pending or posted). Set once at local-row creation,
+   * from the sync batch's own clock. Never updated afterward. Persisted
+   * as transactions.first_seen_at (timestamptz, nullable). */
+  firstSeenAt?: string;
+  /** ISO 8601 timestamp: when BASELINE first learned this transaction
+   * is POSTED. Set at the SAME moment as firstSeenAt if first
+   * discovered already posted; set once, later, at the moment it
+   * reconciles from pending to posted (reconcilePendingToPosted) if
+   * first discovered pending. Undefined while still pending. Never
+   * overwritten once set — a later Plaid `modified` event on an
+   * already-posted transaction must not touch it. THIS, not
+   * firstSeenAt and not postedDate, is what balance-ledger roll-forward
+   * math uses as its boundary (see balanceReconciliation.ts) — but its
+   * ABSENCE must never, by itself, be read as "this transaction is
+   * pending": a manually-entered or pre-Step-6 transaction legitimately
+   * lacks it without being pending. Persisted as
+   * transactions.first_posted_at (timestamptz, nullable). */
+  firstPostedAt?: string;
 }
 
 /** One category's share of a split transaction. A transaction with splits
@@ -292,14 +313,67 @@ export interface PlaidItem {
   historicalPullComplete?: boolean;
 }
 
-/** The Step 6 hook: a raw balance-as-reported-by-Plaid snapshot. No
- * roll-forward projection or offset reconciliation reads this yet — that
- * logic is Step 6, not built here. */
+// ============================================================================
+// Balance reconciliation (rv2.6, Step 6)
+// ============================================================================
+
+/** A confirmed-balance observation. asOfBalance is Plaid's `current`
+ * balance, authoritative at the moment of sync. Immutable once written
+ * — see persistence.ts / the reconcile_account_balance RPC. syncCursor
+ * is provenance (which transactions-sync state was in effect), not
+ * identity. */
 export interface AccountBalanceSnapshot {
   id: string;
   accountId: string;
   asOfBalance: number;
   asOfTimestamp: string; // ISO 8601 timestamp, not just a date
+  syncCursor: string;
+  /** The account's actual latest snapshot id at the moment this one was
+   * created — null only for that account's baseline (its first-ever
+   * snapshot). Persisted as its own immutable field specifically so a
+   * replay of this exact event can be validated against the FULL event
+   * identity, not just this snapshot's scalar balance fields. Forms an
+   * auditable, walkable chain. */
+  priorSnapshotId: string | null;
+}
+
+/** A discrepancy between the locally computed EXPECTED LEDGER balance
+ * (never the pending-inclusive working balance) and a newly confirmed
+ * Plaid balance. Immutable once written. Never mutates a Transaction. */
+export interface ReconciliationOffset {
+  id: string;
+  accountId: string;
+  /** confirmedBalance - expectedLedgerBalance. Positive = Plaid's real
+   * balance came in higher than expected (e.g. an unlogged credit);
+   * negative = lower (e.g. an unlogged fee). */
+  amount: number;
+  priorSnapshotId: string | null; // null only for an account's first-ever snapshot (no offset in that case anyway)
+  newSnapshotId: string;
+  occurredAt: string; // ISO 8601, = new snapshot's asOfTimestamp
+}
+
+/** One row per account per LOCAL calendar day — the day's confirmed
+ * ledger balance. The one mutable/upserted record in the balance-
+ * reconciliation domain — everything else is insert-only. */
+export interface DailyBalanceRecord {
+  id: string;
+  accountId: string;
+  date: IsoDate;
+  balance: number;
+}
+
+/** The subset of a Plaid account-balance object this app consumes. */
+export interface PlaidBalanceData {
+  plaidAccountId: string;
+  currentBalance: number | null; // null -> account is skipped, never defaulted to 0
+}
+
+/** A live balance fetch's result AND when it happened, bound together
+ * at the source — observedAt is captured at the fetch boundary itself,
+ * never supplied independently by a caller. */
+export interface PlaidBalanceObservation {
+  balances: PlaidBalanceData[];
+  observedAt: string; // ISO 8601, captured at the fetch boundary itself
 }
 
 /** The subset of a Plaid transaction object this app consumes. Mirrors

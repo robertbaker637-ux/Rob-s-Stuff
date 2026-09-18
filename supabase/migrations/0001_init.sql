@@ -3,7 +3,12 @@
 -- transaction_splits/merchant_rules/transfer_pair_history added in rv2.3
 -- for the Step 4 transaction model; plaid_items/account_balance_snapshots
 -- added and transactions extended again in rv2.4 for Step 5 Plaid
--- integration — see CHANGELOG v2 rv2.4).
+-- integration — see CHANGELOG v2 rv2.4; rv2.6 converts accounts.id,
+-- transactions.id, debts.id, and account_balance_snapshots.id from uuid
+-- to text — application-generated ids, not DB-generated uuids — and every
+-- FK that references any of them, then adds reconciliation_offsets/
+-- daily_balance_records and the reconcile_account_balance RPC for Step 6
+-- balance reconciliation — see CHANGELOG v2 rv2.6).
 --
 -- Core entities for build-sequence steps 1-3: accounts, income sources /
 -- pay schedules, paychecks, categories / category window budgets, bills,
@@ -55,12 +60,17 @@ create type account_role as enum (
   'savings',
   'hsa',
   'credit_card',
+  'loan',
   'business',
   'other_manual'
 );
 
+-- rv2.6: id is text, not uuid — application-generated (see
+-- src/lib/domain/types.ts), never DB-generated. Every FK referencing
+-- accounts (id) elsewhere in this file is text for the same reason —
+-- see the rv2.6 header note above.
 create table accounts (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   user_id uuid not null references auth.users (id) on delete cascade,
   name text not null,
   role account_role not null,
@@ -183,7 +193,7 @@ create table paychecks (
   actual_amount numeric(12, 2),
   actual_gross numeric(12, 2),
   auto_split_amount numeric(12, 2) not null default 0,
-  auto_split_destination_account_id uuid references accounts (id) on delete set null,
+  auto_split_destination_account_id text references accounts (id) on delete set null,
   is_actual boolean not null default false,
   created_at timestamptz not null default now(),
   constraint actual_fields_required_once_reconciled
@@ -302,7 +312,7 @@ create table sinking_funds (
   target_amount numeric(12, 2) not null,
   current_amount numeric(12, 2) not null default 0,
   priority integer not null,
-  funding_account_id uuid references accounts (id) on delete set null,
+  funding_account_id text references accounts (id) on delete set null,
   created_at timestamptz not null default now()
 );
 
@@ -318,7 +328,7 @@ create index sinking_funds_user_id_idx on sinking_funds (user_id, priority);
 -- ============================================================================
 
 create table debts (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   user_id uuid not null references auth.users (id) on delete cascade,
   name text not null,
   balance numeric(12, 2) not null,
@@ -352,9 +362,9 @@ create index debts_user_id_idx on debts (user_id);
 -- Pre-Plaid, raw_merchant_name/raw_category are typically null since
 -- there's no external enrichment to diverge from yet.
 create table transactions (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   user_id uuid not null references auth.users (id) on delete cascade,
-  account_id uuid not null references accounts (id) on delete cascade,
+  account_id text not null references accounts (id) on delete cascade,
   posted_date date not null,
   pending boolean not null default false,
   amount numeric(12, 2) not null,
@@ -381,6 +391,16 @@ create table transactions (
   -- above never is.
   plaid_transaction_id text unique,
   plaid_pending_transaction_id text,
+
+  -- rv2.6: when BASELINE first learned this transaction exists at all
+  -- (first_seen_at, pending or posted) and when it first learned it was
+  -- POSTED (first_posted_at) — set once each, never overwritten. Both
+  -- null for a transaction that predates rv2.6 (a legacy row) or is
+  -- still pending (first_posted_at only). This is the ledger boundary
+  -- balance reconciliation rolls forward from — never posted_date, never
+  -- raw_date. See src/lib/domain/balanceReconciliation.ts.
+  first_seen_at timestamptz,
+  first_posted_at timestamptz,
 
   created_at timestamptz not null default now()
 );
@@ -415,7 +435,7 @@ create index transactions_plaid_transaction_id_idx on transactions (plaid_transa
 -- yet — the app validates before persisting).
 create table transaction_splits (
   id uuid primary key default gen_random_uuid(),
-  transaction_id uuid not null references transactions (id) on delete cascade,
+  transaction_id text not null references transactions (id) on delete cascade,
   category_id uuid not null references categories (id) on delete cascade,
   amount numeric(12, 2) not null,
   created_at timestamptz not null default now()
@@ -478,8 +498,8 @@ create index merchant_rules_user_id_idx on merchant_rules (user_id);
 create table transfer_pair_history (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
-  account_a_id uuid not null references accounts (id) on delete cascade,
-  account_b_id uuid not null references accounts (id) on delete cascade,
+  account_a_id text not null references accounts (id) on delete cascade,
+  account_b_id text not null references accounts (id) on delete cascade,
   confirmed_count integer not null default 0,
   created_at timestamptz not null default now(),
   unique (user_id, account_a_id, account_b_id),
@@ -532,17 +552,27 @@ alter table plaid_items enable row level security;
 -- nothing else should ever query this table.
 
 -- ============================================================================
--- account_balance_snapshots (rv2.4 — Step 6 storage hook only)
+-- account_balance_snapshots (rv2.4 storage hook; rv2.6 Step 6 makes it real)
 -- ============================================================================
 
--- A raw balance-as-reported-by-Plaid snapshot. No roll-forward
--- projection or offset-reconciliation logic reads this yet — that's
--- Step 6. This table is the minimum hook it will read from.
+-- A confirmed-balance observation. Immutable, insert-only — see the
+-- reconcile_account_balance function below, the only writer. id is
+-- application-generated (see src/lib/domain/balanceReconciliation.ts's
+-- reconcileAccountBalance), never a DB default, so no
+-- gen_random_uuid()-style default here at all. prior_snapshot_id is
+-- null only for an account's baseline (its first-ever snapshot) — see
+-- the reconciliation baseline/epoch design in balanceReconciliation.ts.
+-- No unique/upsert-target constraint on id beyond the primary key: the
+-- RPC checks-then-inserts explicitly rather than relying on
+-- ON CONFLICT, so a same-id-different-content collision is a detected
+-- error, never a silent overwrite.
 create table account_balance_snapshots (
-  id uuid primary key default gen_random_uuid(),
-  account_id uuid not null references accounts (id) on delete cascade,
+  id text primary key,
+  account_id text not null references accounts (id) on delete cascade,
   as_of_balance numeric(12, 2) not null,
   as_of_timestamp timestamptz not null,
+  sync_cursor text not null default '',
+  prior_snapshot_id text references account_balance_snapshots (id),
   created_at timestamptz not null default now()
 );
 
@@ -564,3 +594,244 @@ create policy "account_balance_snapshots_all_own" on account_balance_snapshots
 
 create index account_balance_snapshots_account_id_idx
   on account_balance_snapshots (account_id, as_of_timestamp);
+
+-- ============================================================================
+-- reconciliation_offsets (rv2.6, Step 6)
+-- ============================================================================
+
+-- A discrepancy between the locally computed expected ledger balance and
+-- a newly confirmed Plaid balance. Immutable, insert-only — same
+-- reasoning as account_balance_snapshots. unique(new_snapshot_id)
+-- enforces "each snapshot produces at most one offset" at the database
+-- level, not just by convention.
+create table reconciliation_offsets (
+  id text primary key,
+  account_id text not null references accounts (id) on delete cascade,
+  amount numeric(12, 2) not null,
+  prior_snapshot_id text references account_balance_snapshots (id) on delete cascade,
+  new_snapshot_id text not null references account_balance_snapshots (id) on delete cascade,
+  occurred_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  unique (new_snapshot_id)
+);
+
+alter table reconciliation_offsets enable row level security;
+
+create policy "reconciliation_offsets_all_own" on reconciliation_offsets
+  for all using (
+    exists (
+      select 1 from accounts a
+      where a.id = reconciliation_offsets.account_id and a.user_id = auth.uid()
+    )
+  )
+  with check (
+    exists (
+      select 1 from accounts a
+      where a.id = reconciliation_offsets.account_id and a.user_id = auth.uid()
+    )
+  );
+
+create index reconciliation_offsets_account_id_idx
+  on reconciliation_offsets (account_id, occurred_at);
+
+-- ============================================================================
+-- daily_balance_records (rv2.6, Step 6)
+-- ============================================================================
+
+-- One row per account per LOCAL calendar day — the day's confirmed
+-- ledger balance. The one mutable/upserted record in the balance-
+-- reconciliation domain; everything else above is insert-only.
+-- unique(account_id, date) is the actual upsert target the RPC's
+-- ON CONFLICT clause relies on.
+create table daily_balance_records (
+  id text primary key,
+  account_id text not null references accounts (id) on delete cascade,
+  date date not null,
+  balance numeric(12, 2) not null,
+  created_at timestamptz not null default now(),
+  unique (account_id, date)
+);
+
+alter table daily_balance_records enable row level security;
+
+create policy "daily_balance_records_all_own" on daily_balance_records
+  for all using (
+    exists (
+      select 1 from accounts a
+      where a.id = daily_balance_records.account_id and a.user_id = auth.uid()
+    )
+  )
+  with check (
+    exists (
+      select 1 from accounts a
+      where a.id = daily_balance_records.account_id and a.user_id = auth.uid()
+    )
+  );
+
+create index daily_balance_records_account_id_idx
+  on daily_balance_records (account_id, date);
+
+-- ============================================================================
+-- reconcile_account_balance (rv2.6, Step 6)
+-- ============================================================================
+
+-- The single atomic entry point for persisting one reconciliation event
+-- (a confirmed-balance snapshot, its optional discrepancy offset, and
+-- the day's daily balance record) — see
+-- src/lib/plaid/syncOrchestration.ts's runAccountBalanceReconciliation
+-- and src/lib/plaid/persistence.ts's persistReconciliationEvent, the
+-- only caller. Full design rationale (replay-vs-corruption detection,
+-- compare-and-swap + advisory lock, derived-not-trusted cross-record
+-- fields) is documented in the rv2.6 planning doc; this function is that
+-- design transcribed directly.
+create or replace function reconcile_account_balance(
+  p_account_id text,
+  p_expected_prior_snapshot_id text,   -- null means "no prior snapshot expected" (baseline)
+  p_snapshot_id text,
+  p_as_of_balance numeric(12,2),
+  p_as_of_timestamp timestamptz,
+  p_sync_cursor text,
+  p_offset_id text,                    -- null if this event has no discrepancy
+  p_offset_amount numeric(12,2),
+  p_daily_date date                    -- the timezone-resolved local day this confirmed balance applies to
+) returns void
+language plpgsql
+as $$
+declare
+  v_existing_snapshot account_balance_snapshots%rowtype;
+  v_existing_offset reconciliation_offsets%rowtype;
+  v_offset_existed boolean;
+  v_actual_latest_id text;
+  v_actual_latest_timestamp timestamptz;
+begin
+  -- Serialize every reconciliation attempt for THIS account. Held for
+  -- the lifetime of this transaction (this one function call) only, and
+  -- automatically released on commit or rollback — no separate unlock.
+  perform pg_advisory_xact_lock(hashtext(p_account_id)::bigint);
+
+  -- 1. Replay detection, checked by the snapshot's OWN id, BEFORE the
+  --    compare-and-swap check below (a genuine retry's expected-prior
+  --    is, by definition, no longer the account's actual latest — this
+  --    same event already advanced the chain past it once). Validates
+  --    the COMPLETE event identity, not just the snapshot's scalar
+  --    balance fields.
+  select * into v_existing_snapshot from account_balance_snapshots where id = p_snapshot_id;
+
+  if found then
+    if v_existing_snapshot.account_id is distinct from p_account_id
+       or v_existing_snapshot.as_of_balance is distinct from p_as_of_balance
+       or v_existing_snapshot.as_of_timestamp is distinct from p_as_of_timestamp
+       or v_existing_snapshot.sync_cursor is distinct from p_sync_cursor
+       or v_existing_snapshot.prior_snapshot_id is distinct from p_expected_prior_snapshot_id
+    then
+      raise exception 'snapshot_immutability_violation: % already recorded with different data', p_snapshot_id
+        using errcode = 'B0002';
+    end if;
+
+    select * into v_existing_offset from reconciliation_offsets where new_snapshot_id = p_snapshot_id;
+    v_offset_existed := found;
+
+    if v_offset_existed and p_offset_id is null then
+      raise exception 'offset_immutability_violation: event % originally had an offset, replay supplies none', p_snapshot_id
+        using errcode = 'B0002';
+    elsif not v_offset_existed and p_offset_id is not null then
+      raise exception 'offset_immutability_violation: event % originally had no offset, replay supplies one', p_snapshot_id
+        using errcode = 'B0002';
+    elsif v_offset_existed and p_offset_id is not null then
+      if v_existing_offset.id is distinct from p_offset_id
+         or v_existing_offset.account_id is distinct from p_account_id
+         or v_existing_offset.amount is distinct from p_offset_amount
+         or v_existing_offset.prior_snapshot_id is distinct from p_expected_prior_snapshot_id
+         or v_existing_offset.new_snapshot_id is distinct from p_snapshot_id
+         or v_existing_offset.occurred_at is distinct from p_as_of_timestamp
+      then
+        raise exception 'offset_immutability_violation: % already recorded with different data', p_offset_id
+          using errcode = 'B0002';
+      end if;
+    end if;
+
+    -- Fully validated replay of an already-committed event — snapshot
+    -- AND offset (if any) confirmed byte-identical. Nothing to write.
+    -- daily_balance_records is deliberately UNTOUCHED here: a later,
+    -- genuinely newer observation may already have advanced that same
+    -- local day's record, and replaying this older event must never
+    -- roll it backward.
+    return;
+  end if;
+
+  -- 2. Compare-and-swap: this is a genuinely NEW snapshot (no id match
+  --    above), so the caller's assumed prior must still be the actual
+  --    current latest, checked under the advisory lock acquired above.
+  select id, as_of_timestamp into v_actual_latest_id, v_actual_latest_timestamp
+    from account_balance_snapshots
+    where account_id = p_account_id
+    order by as_of_timestamp desc limit 1;
+
+  if p_expected_prior_snapshot_id is null then
+    if v_actual_latest_id is not null then
+      raise exception 'stale_baseline: expected no prior snapshot for account %, but % already exists', p_account_id, v_actual_latest_id
+        using errcode = 'B0001';
+    end if;
+  else
+    if v_actual_latest_id is distinct from p_expected_prior_snapshot_id then
+      raise exception 'stale_baseline: expected prior % for account %, but latest is %', p_expected_prior_snapshot_id, p_account_id, v_actual_latest_id
+        using errcode = 'B0001';
+    end if;
+    if p_as_of_timestamp <= v_actual_latest_timestamp then
+      raise exception 'chronological_order_violation: new observation % is not after prior %''s %', p_as_of_timestamp, p_expected_prior_snapshot_id, v_actual_latest_timestamp
+        using errcode = 'B0003';
+    end if;
+  end if;
+
+  -- 3. Insert-only: the new immutable snapshot, recording its own
+  --    prior_snapshot_id so a future replay can validate the full
+  --    chain relationship, not just this row's own scalar fields.
+  insert into account_balance_snapshots (id, account_id, as_of_balance, as_of_timestamp, sync_cursor, prior_snapshot_id)
+  values (p_snapshot_id, p_account_id, p_as_of_balance, p_as_of_timestamp, p_sync_cursor, p_expected_prior_snapshot_id);
+
+  -- 4. Insert-only: the optional immutable offset. Cross-record fields
+  --    are DERIVED, never trusted as independent JS input: new_snapshot_id
+  --    is always THIS call's own snapshot, occurred_at is always THIS
+  --    snapshot's own timestamp, account_id is always THIS call's
+  --    account, prior_snapshot_id is always the already-validated
+  --    expected prior.
+  if p_offset_id is not null then
+    insert into reconciliation_offsets (id, account_id, amount, prior_snapshot_id, new_snapshot_id, occurred_at)
+    values (p_offset_id, p_account_id, p_offset_amount, p_expected_prior_snapshot_id, p_snapshot_id, p_as_of_timestamp);
+  end if;
+
+  -- 5. The one deliberately-mutable record: latest confirmed balance for
+  --    this account on this local calendar day — derived ENTIRELY from
+  --    THIS event's own account and confirmed balance (p_account_id,
+  --    p_as_of_balance) plus the caller-supplied local date. There is
+  --    no independent p_daily_balance/p_daily_record_id input: a
+  --    reconciliation event has exactly one confirmed balance, and the
+  --    daily record can never disagree with it, structurally, because
+  --    nothing else is ever passed in to disagree WITH. Chronology here
+  --    is already guaranteed by step 2 above (every new snapshot must
+  --    be strictly after the account's actual latest), so a normal,
+  --    non-replay write can never regress this to an older value —
+  --    only a validated replay (which never reaches this line, see
+  --    step 1's early return) could otherwise risk that.
+  insert into daily_balance_records (id, account_id, date, balance)
+  values ('daily-' || p_account_id || '-' || p_daily_date::text, p_account_id, p_daily_date, p_as_of_balance)
+  on conflict (account_id, date) do update set balance = excluded.balance, id = excluded.id;
+end;
+$$;
+
+-- Explicit signature in every privilege statement — the type list must
+-- exactly match the function's declared parameter types above; if that
+-- signature ever changes, these four statements are updated in the same
+-- migration, not left to drift against an ambiguous bare name.
+revoke all on function reconcile_account_balance(
+  text, text, text, numeric, timestamptz, text, text, numeric, date
+) from public;
+revoke all on function reconcile_account_balance(
+  text, text, text, numeric, timestamptz, text, text, numeric, date
+) from anon;
+revoke all on function reconcile_account_balance(
+  text, text, text, numeric, timestamptz, text, text, numeric, date
+) from authenticated;
+grant execute on function reconcile_account_balance(
+  text, text, text, numeric, timestamptz, text, text, numeric, date
+) to service_role;

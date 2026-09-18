@@ -24,7 +24,6 @@
 import { applyMerchantMemory } from "./merchantMemory";
 import type {
   Account,
-  AccountBalanceSnapshot,
   AccountRole,
   Debt,
   MerchantRule,
@@ -53,11 +52,17 @@ export function mapPlaidTransactionToRaw(plaidTxn: PlaidTransactionData) {
 
 /** A brand-new local transaction from a Plaid "added" event. Runs
  * through the unmodified applyMerchantMemory for categorization —
- * nothing here reimplements that logic. */
+ * nothing here reimplements that logic.
+ *
+ * `batchTimestamp` (defaults to the real clock) is the one moment this
+ * whole sync batch is considered to have happened at — used to set
+ * firstSeenAt (always) and firstPostedAt (only if this transaction is
+ * discovered already posted; see types.ts). Injectable for tests. */
 export function createLocalTransactionFromPlaid(
   plaidTxn: PlaidTransactionData,
   localAccountId: string,
-  merchantRules: MerchantRule[]
+  merchantRules: MerchantRule[],
+  batchTimestamp: string = new Date().toISOString()
 ): Transaction {
   const raw = mapPlaidTransactionToRaw(plaidTxn);
   const uncategorized: Transaction = {
@@ -72,6 +77,8 @@ export function createLocalTransactionFromPlaid(
     needsReview: true,
     plaidTransactionId: plaidTxn.transactionId,
     plaidPendingTransactionId: plaidTxn.pendingTransactionId,
+    firstSeenAt: batchTimestamp,
+    firstPostedAt: plaidTxn.pending ? undefined : batchTimestamp,
   };
   return applyMerchantMemory(uncategorized, merchantRules);
 }
@@ -102,14 +109,25 @@ export function applyPlaidModifiedToLocal(
  * applyPlaidModifiedToLocal (raw fields only), plus the identity swap
  * Plaid itself performs (a new transaction_id) and clearing `pending`.
  * Our own internal `id` — and everything keyed off it, like splits or a
- * bill link — never changes. */
+ * bill link — never changes.
+ *
+ * `batchTimestamp` (defaults to the real clock) is when THIS sync batch
+ * — the one that discovered the posting — happened. firstPostedAt is
+ * set from it, exactly once: `existing.firstPostedAt ?? batchTimestamp`
+ * preserves an already-set value (shouldn't happen in practice, since a
+ * transaction only posts once, but keeps this idempotent regardless).
+ * firstSeenAt is never touched — it survives via applyPlaidModifiedToLocal's
+ * spread of `existing`, from whenever this transaction was first
+ * discovered while still pending. */
 export function reconcilePendingToPosted(
   existing: Transaction,
-  postedPlaidTxn: PlaidTransactionData
+  postedPlaidTxn: PlaidTransactionData,
+  batchTimestamp: string = new Date().toISOString()
 ): Transaction {
   return {
     ...applyPlaidModifiedToLocal(existing, postedPlaidTxn),
     pending: false,
+    firstPostedAt: existing.firstPostedAt ?? batchTimestamp,
   };
 }
 
@@ -127,12 +145,17 @@ export function reconcilePendingToPosted(
  * Idempotency: an `added` item whose transactionId already exists
  * locally (a replayed/duplicate sync) updates that row instead of
  * creating a second one.
+ *
+ * `batchTimestamp` (defaults to the real clock) is passed through to
+ * every created/posted transaction in this batch — one moment for the
+ * whole batch, matching "when this sync learned about it."
  */
 export function syncPlaidTransactions(
   localTransactions: Transaction[],
   batch: PlaidSyncBatch,
   accountIdByPlaidAccountId: Map<string, string>,
-  merchantRules: MerchantRule[]
+  merchantRules: MerchantRule[],
+  batchTimestamp: string = new Date().toISOString()
 ): SyncResult {
   const byPlaidId = new Map<string, Transaction>();
   for (const t of localTransactions) {
@@ -160,7 +183,7 @@ export function syncPlaidTransactions(
     const pendingId = plaidTxn.pendingTransactionId;
     const matchedPending = pendingId ? byPlaidId.get(pendingId) : undefined;
     if (matchedPending) {
-      const reconciled = reconcilePendingToPosted(matchedPending, plaidTxn);
+      const reconciled = reconcilePendingToPosted(matchedPending, plaidTxn, batchTimestamp);
       resultById.set(reconciled.id, reconciled);
       consumedRemovedIds.add(pendingId!);
       reconciledPendingToPosted++;
@@ -169,7 +192,7 @@ export function syncPlaidTransactions(
 
     const localAccountId = accountIdByPlaidAccountId.get(plaidTxn.plaidAccountId);
     if (!localAccountId) continue; // unmapped account — nothing to attach to
-    const created_ = createLocalTransactionFromPlaid(plaidTxn, localAccountId, merchantRules);
+    const created_ = createLocalTransactionFromPlaid(plaidTxn, localAccountId, merchantRules, batchTimestamp);
     resultById.set(created_.id, created_);
     created++;
   }
@@ -184,7 +207,7 @@ export function syncPlaidTransactions(
     }
     const localAccountId = accountIdByPlaidAccountId.get(plaidTxn.plaidAccountId);
     if (!localAccountId) continue;
-    const created_ = createLocalTransactionFromPlaid(plaidTxn, localAccountId, merchantRules);
+    const created_ = createLocalTransactionFromPlaid(plaidTxn, localAccountId, merchantRules, batchTimestamp);
     resultById.set(created_.id, created_);
     created++;
   }
@@ -216,6 +239,7 @@ export function syncPlaidTransactions(
  */
 function inferAccountRoleFromPlaid(account: PlaidAccountData): AccountRole {
   if (account.type === "credit") return "credit_card";
+  if (account.type === "loan") return "loan";
   if (account.subtype === "hsa") return "hsa";
   if (account.subtype === "savings") return "savings";
   return "other_manual";
@@ -350,16 +374,6 @@ export function syncPlaidLiabilities(
   }
 
   return result;
-}
-
-/** The Step 6 hook: records a raw balance snapshot. No roll-forward or
- * offset-reconciliation logic reads this — that's Step 6. */
-export function recordAccountBalanceSnapshot(
-  accountId: string,
-  asOfBalance: number,
-  asOfTimestamp: string
-): AccountBalanceSnapshot {
-  return { id: `snapshot-${accountId}-${asOfTimestamp}`, accountId, asOfBalance, asOfTimestamp };
 }
 
 /** Pure PlaidItem -> PlaidItem transition. Takes no accounts/transactions

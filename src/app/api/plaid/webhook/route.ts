@@ -25,16 +25,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import { routeTransactionsWebhook, type PlaidWebhookPayload } from "@/lib/plaid/webhookHandlers";
 import { sanitizePlaidError } from "@/lib/plaid/errors";
-import { createPlaidFetchPage, fetchPlaidJwk } from "@/lib/plaid/syncAdapters";
-import { runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
+import { createPlaidFetchPage, fetchAccountBalanceObservation, fetchPlaidJwk, resolveReconciliationTimezone } from "@/lib/plaid/syncAdapters";
+import { runAccountBalanceReconciliation, runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
 import { createJwkCache, verifyPlaidWebhook } from "@/lib/plaid/webhookVerification";
 import {
   getItemByPlaidItemId,
+  getLatestAccountBalanceSnapshot,
   getPlaidItemAccessToken,
   loadAccountIdByPlaidAccountId,
   loadMerchantRules,
+  loadTransactionsForAccount,
+  loadUserAccounts,
   loadUserTransactions,
   markHistoricalPullComplete,
+  persistReconciliationEvent,
   persistTransactions,
   updateItemCursor,
 } from "@/lib/plaid/persistence";
@@ -62,6 +66,16 @@ async function runSyncForItem(item: PlaidItem): Promise<void> {
   });
 
   await updateItemCursor(item.id, newCursor);
+
+  await runAccountBalanceReconciliation({
+    accounts: await loadUserAccounts(item.userId),
+    fetchBalances: () => fetchAccountBalanceObservation(accessToken),
+    syncCursor: newCursor,
+    getLatestSnapshot: getLatestAccountBalanceSnapshot,
+    loadTransactionsForAccount: (accountId) => loadTransactionsForAccount(item.userId, accountId),
+    persistReconciliationEvent,
+    timezone: resolveReconciliationTimezone(),
+  });
 }
 
 export async function POST(request: NextRequest) {

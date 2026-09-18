@@ -12,18 +12,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { plaidClient } from "@/lib/plaid/client";
 import { sanitizePlaidError } from "@/lib/plaid/errors";
-import { createPlaidFetchPage, mapLiabilitiesResponseToLiabilityData } from "@/lib/plaid/syncAdapters";
-import { runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
 import {
+  createPlaidFetchPage,
+  mapBalanceResponseToBalanceData,
+  mapLiabilitiesResponseToLiabilityData,
+  resolveReconciliationTimezone,
+} from "@/lib/plaid/syncAdapters";
+import { runAccountBalanceReconciliation, runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
+import {
+  getLatestAccountBalanceSnapshot,
   insertPlaidItem,
   loadMerchantRules,
+  loadTransactionsForAccount,
   persistAccounts,
   persistDebts,
+  persistReconciliationEvent,
   persistTransactions,
   updateItemCursor,
 } from "@/lib/plaid/persistence";
 import { syncPlaidAccounts, syncPlaidLiabilities } from "@/lib/domain/plaidSync";
-import type { PlaidAccountData } from "@/lib/domain/types";
+import type { PlaidAccountData, PlaidBalanceObservation } from "@/lib/domain/types";
 
 export async function POST(request: NextRequest) {
   const { publicToken, userId } = await request.json();
@@ -49,7 +57,16 @@ export async function POST(request: NextRequest) {
 
     // Accounts: create-or-update by plaidAccountId, then build the
     // Plaid-account-id -> our-account-id map the transaction sync needs.
+    // This same balance fetch also seeds balance reconciliation below —
+    // observedAt is captured immediately on resolution here, the fetch
+    // boundary, and carried forward rather than re-fetched or
+    // re-timestamped when reconciliation runs (see syncOrchestration.ts's
+    // FetchBalanceObservation doc comment).
     const balanceResponse = await plaidClient.accountsBalanceGet({ access_token: accessToken });
+    const balanceObservation: PlaidBalanceObservation = {
+      balances: mapBalanceResponseToBalanceData(balanceResponse.data),
+      observedAt: new Date().toISOString(),
+    };
     const plaidAccounts: PlaidAccountData[] = balanceResponse.data.accounts.map((a) => ({
       plaidAccountId: a.account_id,
       name: a.name,
@@ -100,6 +117,20 @@ export async function POST(request: NextRequest) {
       persistTransactions: (transactions) => persistTransactions(userId, transactions),
     });
     await updateItemCursor(item.id, newCursor);
+
+    // Balance reconciliation for this brand-new Item establishes each
+    // linked account's reconciliation baseline/epoch — see
+    // reconcileAccountBalance in balanceReconciliation.ts. Reuses the
+    // balance observation already captured above; no second Plaid call.
+    await runAccountBalanceReconciliation({
+      accounts,
+      fetchBalances: async () => balanceObservation,
+      syncCursor: newCursor,
+      getLatestSnapshot: getLatestAccountBalanceSnapshot,
+      loadTransactionsForAccount: (accountId) => loadTransactionsForAccount(userId, accountId),
+      persistReconciliationEvent,
+      timezone: resolveReconciliationTimezone(),
+    });
 
     return NextResponse.json({
       itemId: item.id,

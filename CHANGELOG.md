@@ -1,5 +1,104 @@
 # BASELINE Changelog
 
+## v2 rv2.6 — 2026-09-18
+
+Step 6: Balance Reconciliation. Confirmed Plaid balances are authoritative
+at the moment of sync; the app rolls forward locally between syncs using
+posted (never pending) transaction activity; a discrepancy between the
+two is recorded as an explicit, immutable `ReconciliationOffset` — never
+papered over by rewriting transaction history. `payWindow.ts`,
+`paycheck.ts`, `sweep.ts`, `categoryAllocation.ts`,
+`calendarReporting.ts`, `merchantMemory.ts`, `transactionSplits.ts`, and
+`transferDetection.ts` have zero diff — confirmed with `git diff --stat`
+before committing.
+
+- **New domain types** (`src/lib/domain/types.ts`): `AccountBalanceSnapshot`
+  gains `syncCursor` and `priorSnapshotId` (its own immutable chain
+  identity, forming an auditable, walkable history — never inferred from
+  cursor or balance). New `ReconciliationOffset`, `DailyBalanceRecord`,
+  `PlaidBalanceData`, `PlaidBalanceObservation`. `AccountRole` gains
+  `loan` (TypeScript and the Postgres `account_role` enum, in the same
+  pass — closes a real classification gap where a Plaid `loan`-type
+  account fell through to `other_manual`, asset-side). `Transaction`
+  gains `firstSeenAt`/`firstPostedAt` — real, persisted, immutable-once-set
+  timestamps threaded through `plaidSync.ts`'s sync/reconciliation path
+  via a per-batch `batchTimestamp`. `firstPostedAt`, not `firstSeenAt` and
+  never `postedDate`, is the one ledger-roll-forward boundary — and its
+  absence is never read as "pending": `computeWorkingBalance`'s pending
+  overlay checks the real `pending` boolean directly.
+- **New pure domain module** (`src/lib/domain/balanceReconciliation.ts`):
+  `computeExpectedLedgerBalance`/`computeWorkingBalance` (role-aware via
+  `applyLedgerDelta`/`isLiabilityRole`), `reconcileAccountBalance` (the
+  core per-observation reconciliation step), `computeNetWorthForDate`
+  (explicitly scoped to Plaid-linked accounts via
+  `filterBalanceTrackedAccounts` — manual accounts have no balance-history
+  mechanism yet, and the contract says so). An account's first-ever
+  snapshot is its **reconciliation baseline/epoch**: unconditional ground
+  truth, no offset, and every pre-existing local transaction (lacking
+  `firstPostedAt` because the field predates it) stays permanently and
+  correctly invisible to ledger math — nothing ever fabricated or
+  backfilled to explain it away.
+- **Orchestration** (`src/lib/plaid/syncOrchestration.ts`):
+  `runAccountBalanceReconciliation` reconciles every Plaid-linked account
+  against one balance observation, one atomic `persistReconciliationEvent`
+  call per account, with a bounded one-time retry on a recognized
+  stale-baseline concurrency error (`isStaleBaselineError`, SQLSTATE
+  `B0001`) — re-fetching the account's actual latest snapshot and
+  recomputing against the *same* already-fetched balance observation,
+  never a second Plaid call. `src/lib/plaid/syncAdapters.ts`'s
+  `fetchAccountBalanceObservation` captures `observedAt` at the exact
+  moment the Plaid balance fetch resolves, never passed in independently.
+- **Persistence** (`src/lib/plaid/persistence.ts`,
+  `supabase/migrations/0001_init.sql`): a single atomic Postgres function,
+  `reconcile_account_balance`, persists a snapshot + optional offset +
+  daily record together — a snapshot committing while its offset doesn't
+  is structurally impossible. Snapshots and offsets are true insert-only
+  rows with replay-vs-corruption detection validated against the full
+  event identity (a same-id resubmission with different content is a hard
+  failure, `B0002`); a per-account `pg_advisory_xact_lock` plus a
+  compare-and-swap check on the account's actual latest snapshot prevents
+  two concurrent reconciliations from forking the history into two
+  branches. Cross-record fields (an offset's `new_snapshot_id`/
+  `occurred_at`/`account_id`, a daily record's `id`/`account_id`/
+  `balance`) are always derived in SQL from the event's own snapshot,
+  never trusted as independent, potentially-disagreeing caller input —
+  `ReconciliationEvent` itself carries exactly one account identity and
+  one confirmed balance. Execution is restricted to `service_role` via
+  explicit `REVOKE`/`GRANT` statements naming the function's full
+  signature.
+- **Schema audit**: `accounts.id`, `transactions.id`, `debts.id`, and
+  `account_balance_snapshots.id` converted from `uuid` to `text`
+  (application-generated ids, never DB-generated), along with every FK
+  referencing them (seven columns across five tables) — closes a
+  pre-existing id-type mismatch. New `reconciliation_offsets` and
+  `daily_balance_records` tables, RLS-scoped through `accounts` like
+  `account_balance_snapshots`. New `transactions.first_seen_at`/
+  `first_posted_at` columns.
+- **Wired into all three Plaid entry points**
+  (`exchange-public-token`/`sync`/`webhook` routes): reconciliation runs
+  after each transaction sync is fully persisted and its cursor advanced.
+  `exchange-public-token` reuses its existing `accountsBalanceGet` call
+  (already made for liability lookups) rather than fetching balances
+  twice.
+- **A documented, accepted provider-API limitation**: a transaction that
+  posts at the bank between a `/transactions/sync` call and a
+  `/accounts/balance/get` call produces a self-correcting *pair* of
+  offsets (investigated against Plaid's actual API guarantees, not
+  assumed) — `firstPostedAt` is never redefined or overloaded to paper
+  over it.
+- **Tests**: `tests/domain/balanceReconciliation.test.ts` (pure domain
+  functions, the reconciliation baseline/epoch across 4 explicit legacy-
+  transaction cases, the self-correcting offset-pair scenario, net worth),
+  `tests/plaid/balanceSyncOrchestration.test.ts` (orchestration against a
+  mock persistence layer replicating the RPC's own replay/CAS/corruption
+  contract, including baseline and ordinary concurrency retries),
+  `tests/plaid/persistence.test.ts` (the `firstSeenAt`/`firstPostedAt`
+  row-mapping round trip), `tests/schema/idColumnTypes.test.ts` (a
+  structural, textual parse of the migration file itself — no live
+  Postgres exists yet — asserting every converted table/FK/enum value/
+  privilege statement, so a future forgotten conversion fails
+  automatically rather than drifting silently).
+
 ## v2 rv2.5 — 2026-09-18
 
 Plaid Integration Hardening & Liability Completion. Closes the three gaps

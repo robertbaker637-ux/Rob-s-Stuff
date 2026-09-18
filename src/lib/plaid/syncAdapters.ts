@@ -11,6 +11,7 @@
 
 import type {
   APR,
+  AccountsGetResponse,
   CreditCardLiability,
   LiabilitiesGetResponse,
   MortgageLiability,
@@ -20,7 +21,14 @@ import type {
 import { plaidClient } from "./client";
 import type { FetchSyncPage, PlaidSyncPage } from "./syncOrchestration";
 import type { JwkKey } from "./webhookVerification";
-import type { PlaidAprEntry, PlaidLiabilityData, PlaidTransactionData, SkippedLiability } from "@/lib/domain/types";
+import type {
+  PlaidAprEntry,
+  PlaidBalanceData,
+  PlaidBalanceObservation,
+  PlaidLiabilityData,
+  PlaidTransactionData,
+  SkippedLiability,
+} from "@/lib/domain/types";
 
 function toPlaidTransactionData(t: PlaidApiTransaction): PlaidTransactionData {
   return {
@@ -167,6 +175,43 @@ export function mapLiabilitiesResponseToLiabilityData(response: LiabilitiesGetRe
   }
 
   return { liabilities, skipped };
+}
+
+// ============================================================================
+// Balance observation (rv2.6, Step 6)
+// ============================================================================
+
+/** current ?? null passed through untouched — never defaulted to 0. A
+ * null current (Plaid sometimes can't determine it, e.g. limited-purpose
+ * checking accounts) means that account is skipped downstream, never
+ * treated as a real balance. */
+export function mapBalanceResponseToBalanceData(response: AccountsGetResponse): PlaidBalanceData[] {
+  return response.accounts.map((a) => ({
+    plaidAccountId: a.account_id,
+    currentBalance: a.balances.current ?? null,
+  }));
+}
+
+/** The real balance-fetch implementation. observedAt is captured
+ * immediately after the successful fetch resolves — not later, not
+ * passed in — so it always corresponds to the actual moment this
+ * balance was confirmed. See balanceReconciliation.ts /
+ * syncOrchestration.ts for how this feeds reconciliation. */
+export async function fetchAccountBalanceObservation(accessToken: string): Promise<PlaidBalanceObservation> {
+  const response = await plaidClient.accountsBalanceGet({ access_token: accessToken });
+  const observedAt = new Date().toISOString();
+  return { balances: mapBalanceResponseToBalanceData(response.data), observedAt };
+}
+
+/** There's no user-settings/timezone feature in BASELINE yet — this is
+ * the one place that default lives, so every route wiring
+ * runAccountBalanceReconciliation reads the same value rather than each
+ * hardcoding its own. Building an actual per-user timezone setting is
+ * out of scope this pass; what's in scope is that the date math itself
+ * (localCalendarDate) is correct the moment such a setting exists to
+ * feed it. */
+export function resolveReconciliationTimezone(): string {
+  return process.env.BASELINE_TIMEZONE ?? "America/New_York";
 }
 
 // ============================================================================

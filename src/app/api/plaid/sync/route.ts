@@ -8,14 +8,18 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { sanitizePlaidError } from "@/lib/plaid/errors";
-import { createPlaidFetchPage } from "@/lib/plaid/syncAdapters";
-import { runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
+import { createPlaidFetchPage, fetchAccountBalanceObservation, resolveReconciliationTimezone } from "@/lib/plaid/syncAdapters";
+import { runAccountBalanceReconciliation, runPlaidTransactionsSync } from "@/lib/plaid/syncOrchestration";
 import {
   getItemByPlaidItemId,
+  getLatestAccountBalanceSnapshot,
   getPlaidItemAccessToken,
   loadAccountIdByPlaidAccountId,
   loadMerchantRules,
+  loadTransactionsForAccount,
+  loadUserAccounts,
   loadUserTransactions,
+  persistReconciliationEvent,
   persistTransactions,
   updateItemCursor,
 } from "@/lib/plaid/persistence";
@@ -38,8 +42,10 @@ export async function POST(request: NextRequest) {
       loadMerchantRules(userId),
     ]);
 
+    const accessToken = await getPlaidItemAccessToken(item.id);
+
     const { syncResult, newCursor } = await runPlaidTransactionsSync({
-      fetchPage: createPlaidFetchPage(await getPlaidItemAccessToken(item.id)),
+      fetchPage: createPlaidFetchPage(accessToken),
       startingCursor: item.transactionsCursor ?? "",
       localTransactions,
       accountIdByPlaidAccountId,
@@ -50,6 +56,19 @@ export async function POST(request: NextRequest) {
     // Cursor only ever gets written here, after persistTransactions
     // above has already resolved successfully.
     await updateItemCursor(item.id, newCursor);
+
+    // Balance reconciliation runs after the transaction sync is fully
+    // persisted and the cursor advanced — see the canonical-order note
+    // in syncOrchestration.ts's FetchBalanceObservation doc comment.
+    await runAccountBalanceReconciliation({
+      accounts: await loadUserAccounts(userId),
+      fetchBalances: () => fetchAccountBalanceObservation(accessToken),
+      syncCursor: newCursor,
+      getLatestSnapshot: getLatestAccountBalanceSnapshot,
+      loadTransactionsForAccount: (accountId) => loadTransactionsForAccount(userId, accountId),
+      persistReconciliationEvent,
+      timezone: resolveReconciliationTimezone(),
+    });
 
     return NextResponse.json({
       created: syncResult.created,
