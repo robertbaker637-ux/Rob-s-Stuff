@@ -20,6 +20,9 @@ export interface Account {
   name: string;
   role: AccountRole;
   isManual: boolean;
+  /** Set once linked via Plaid. Absent for manual accounts. */
+  plaidAccountId?: string;
+  plaidItemId?: string;
 }
 
 export type IncomeSourceType = "regular" | "irregular";
@@ -130,6 +133,8 @@ export interface Debt {
   balance: number;
   apr?: number;
   minimumPayment?: number;
+  /** Set once linked via Plaid Liabilities. Absent for manually-entered debts. */
+  plaidLiabilityId?: string;
 }
 
 /**
@@ -174,6 +179,17 @@ export interface Transaction {
   /** Shared id pairing this transaction with its other leg once
    * confirmed as an internal transfer. See transferDetection.ts. */
   transferLinkId?: string;
+
+  /** Plaid's stable transaction_id. The idempotency key for sync — see
+   * plaidSync.ts. Absent for manually-entered transactions. When a
+   * pending transaction posts, Plaid issues a NEW transaction_id, so
+   * this field changes in place on reconciliation (see
+   * reconcilePendingToPosted) while our own `id` above never does. */
+  plaidTransactionId?: string;
+  /** Plaid's pending_transaction_id on a just-posted transaction,
+   * pointing back at the pending transaction_id it replaces. Only
+   * meaningful transiently, during sync — see plaidSync.ts. */
+  plaidPendingTransactionId?: string;
 }
 
 /** One category's share of a split transaction. A transaction with splits
@@ -222,4 +238,95 @@ export interface TransferCandidate {
 export interface CanonicalWindow {
   start: IsoDate;
   end: IsoDate;
+}
+
+// ============================================================================
+// Plaid integration (rv2.4, Step 5)
+// ============================================================================
+
+export type PlaidItemStatus = "active" | "login_required" | "error";
+
+/**
+ * One linked institution connection. Deliberately has NO access_token
+ * field — that lives only in a server-only shape inside src/lib/plaid/,
+ * never in this shared type, so nothing under src/app or src/components
+ * can accidentally receive or serialize it. See plaidSync.ts and
+ * syncOrchestration.ts.
+ */
+export interface PlaidItem {
+  id: string;
+  userId: string;
+  plaidItemId: string;
+  institutionName?: string;
+  status: PlaidItemStatus;
+  errorCode?: string;
+  /** Cursor for /transactions/sync — advanced only after a complete sync
+   * batch has been fetched AND successfully persisted. */
+  transactionsCursor?: string;
+  lastSuccessfulSyncAt?: IsoDate;
+  /** Set when a SYNC_UPDATES_AVAILABLE webhook's payload carries
+   * historical_update_complete: true — always as a side effect of that
+   * same sync call, never set in place of running it. */
+  historicalPullComplete?: boolean;
+}
+
+/** The Step 6 hook: a raw balance-as-reported-by-Plaid snapshot. No
+ * roll-forward projection or offset reconciliation reads this yet — that
+ * logic is Step 6, not built here. */
+export interface AccountBalanceSnapshot {
+  id: string;
+  accountId: string;
+  asOfBalance: number;
+  asOfTimestamp: string; // ISO 8601 timestamp, not just a date
+}
+
+/** The subset of a Plaid transaction object this app consumes. Mirrors
+ * Plaid's own field names/shapes (snake_case in Plaid's actual API;
+ * camelCase here since this is our mapped intermediate shape, not the
+ * wire format). Amount sign convention matches Plaid's own: positive =
+ * outflow, negative = inflow — same convention transferDetection.ts
+ * already uses, so no conversion is needed anywhere in this pipeline. */
+export interface PlaidTransactionData {
+  transactionId: string;
+  pendingTransactionId?: string;
+  plaidAccountId: string;
+  amount: number;
+  date: IsoDate;
+  pending: boolean;
+  merchantName?: string;
+  name: string;
+  category?: string[];
+}
+
+export interface PlaidSyncBatch {
+  added: PlaidTransactionData[];
+  modified: PlaidTransactionData[];
+  removed: { transactionId: string }[];
+}
+
+export interface SyncResult {
+  transactions: Transaction[];
+  created: number;
+  updated: number;
+  reconciledPendingToPosted: number;
+  removed: number;
+}
+
+/** The subset of a Plaid account object this app consumes, for
+ * create-or-update account persistence (see syncPlaidAccounts). */
+export interface PlaidAccountData {
+  plaidAccountId: string;
+  name: string;
+  /** Plaid's AccountType: "depository" | "credit" | "loan" | "investment" | "other". */
+  type: string;
+  subtype?: string;
+}
+
+export interface PlaidLiabilityData {
+  plaidLiabilityId: string;
+  currentBalance: number;
+  apr?: number;
+  minimumPaymentAmount?: number;
+  /** From the paired /accounts/get response, when creating a new Debt. */
+  accountName?: string;
 }

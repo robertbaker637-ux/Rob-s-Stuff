@@ -17,7 +17,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <span className="text-sm font-semibold tracking-wide text-neutral-100">
                 BASELINE
               </span>
-              <span className="ml-2 text-xs text-neutral-500">by Baker HQ · v2 rv2.3</span>
+              <span className="ml-2 text-xs text-neutral-500">by Baker HQ · v2 rv2.4</span>
             </div>
             <nav className="flex gap-5 text-sm text-neutral-400">
               <Link href="/dashboard" className="hover:text-neutral-100">

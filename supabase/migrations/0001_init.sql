@@ -1,7 +1,9 @@
 -- BASELINE v2 rv2.1 — initial schema (paychecks/income_sources amended in
 -- rv2.2 for projected/actual reconciliation; transactions extended and
 -- transaction_splits/merchant_rules/transfer_pair_history added in rv2.3
--- for the Step 4 transaction model — see CHANGELOG v2 rv2.3).
+-- for the Step 4 transaction model; plaid_items/account_balance_snapshots
+-- added and transactions extended again in rv2.4 for Step 5 Plaid
+-- integration — see CHANGELOG v2 rv2.4).
 --
 -- Core entities for build-sequence steps 1-3: accounts, income sources /
 -- pay schedules, paychecks, categories / category window budgets, bills,
@@ -364,6 +366,14 @@ create table transactions (
   bill_id uuid references bills (id) on delete set null,
   transfer_link_id uuid,
 
+  -- rv2.4: Plaid's stable transaction_id is the idempotency key for sync
+  -- (see src/lib/domain/plaidSync.ts). Absent for manually-entered rows.
+  -- When a pending transaction posts, Plaid issues a NEW transaction_id,
+  -- so this column is updated in place on reconciliation — our own `id`
+  -- above never is.
+  plaid_transaction_id text unique,
+  plaid_pending_transaction_id text,
+
   created_at timestamptz not null default now()
 );
 
@@ -377,6 +387,7 @@ create index transactions_account_id_idx on transactions (account_id);
 create index transactions_posted_date_idx on transactions (posted_date);
 create index transactions_bill_id_idx on transactions (bill_id);
 create index transactions_transfer_link_id_idx on transactions (transfer_link_id);
+create index transactions_plaid_transaction_id_idx on transactions (plaid_transaction_id);
 
 -- Canonical-window assignment for a transaction is computed from
 -- posted_date via assignDateToCanonicalWindow (see
@@ -473,3 +484,75 @@ create policy "transfer_pair_history_all_own" on transfer_pair_history
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
 create index transfer_pair_history_user_id_idx on transfer_pair_history (user_id);
+
+-- ============================================================================
+-- plaid_items (rv2.4, Step 5)
+-- ============================================================================
+
+create type plaid_item_status as enum ('active', 'login_required', 'error');
+
+-- One linked institution connection. access_token is SERVICE-ROLE-ONLY:
+-- deliberately no RLS policy grants any access to it at all (not even
+-- to the owning user via the anon/authenticated client) — only the
+-- service_role key, which bypasses RLS entirely, can read or write this
+-- table, and every place that does so lives under src/lib/plaid/,
+-- server-only, never shipped to the client bundle. See
+-- src/lib/domain/types.ts's PlaidItem, which has NO access_token field
+-- for exactly this reason.
+create table plaid_items (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  plaid_item_id text not null unique,
+  institution_name text,
+  status plaid_item_status not null default 'active',
+  error_code text,
+  access_token text not null,
+  -- Cursor for /transactions/sync. Advanced only after a complete sync
+  -- batch (all pages) has been fetched AND successfully persisted — see
+  -- src/lib/plaid/syncOrchestration.ts.
+  transactions_cursor text,
+  last_successful_sync_at timestamptz,
+  -- Set when a SYNC_UPDATES_AVAILABLE webhook's payload carries
+  -- historical_update_complete: true. Always a side effect of running
+  -- that same sync, never set in place of it.
+  historical_pull_complete boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+alter table plaid_items enable row level security;
+-- No policies created — service_role bypasses RLS by default, and
+-- nothing else should ever query this table.
+
+-- ============================================================================
+-- account_balance_snapshots (rv2.4 — Step 6 storage hook only)
+-- ============================================================================
+
+-- A raw balance-as-reported-by-Plaid snapshot. No roll-forward
+-- projection or offset-reconciliation logic reads this yet — that's
+-- Step 6. This table is the minimum hook it will read from.
+create table account_balance_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  account_id uuid not null references accounts (id) on delete cascade,
+  as_of_balance numeric(12, 2) not null,
+  as_of_timestamp timestamptz not null,
+  created_at timestamptz not null default now()
+);
+
+alter table account_balance_snapshots enable row level security;
+
+create policy "account_balance_snapshots_all_own" on account_balance_snapshots
+  for all using (
+    exists (
+      select 1 from accounts a
+      where a.id = account_balance_snapshots.account_id and a.user_id = auth.uid()
+    )
+  )
+  with check (
+    exists (
+      select 1 from accounts a
+      where a.id = account_balance_snapshots.account_id and a.user_id = auth.uid()
+    )
+  );
+
+create index account_balance_snapshots_account_id_idx
+  on account_balance_snapshots (account_id, as_of_timestamp);

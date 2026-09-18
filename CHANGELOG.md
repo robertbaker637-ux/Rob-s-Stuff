@@ -1,5 +1,75 @@
 # BASELINE Changelog
 
+## v2 rv2.4 — 2026-09-18
+
+Step 5 of the build sequence: Plaid integration. No live Plaid or
+Supabase project exists yet, so the SDK client/route/Link scaffolding is
+real, correctly-written code that can't be runtime-exercised this
+pass — same treatment rv2.1 gave Supabase Auth. Every test requirement
+you listed is about the sync/mapping logic, which is fully testable
+without live Plaid, and that's where this pass's rigor lives: 80 tests
+total (18 new), including every rv2.1-2.3 test rerun unmodified.
+`payWindow.ts`, `paycheck.ts`, `sweep.ts`, `categoryAllocation.ts`,
+`calendarReporting.ts`, `merchantMemory.ts`, `transactionSplits.ts`, and
+`transferDetection.ts` have zero diff — confirmed with `git diff --stat`
+before committing.
+
+- **Idempotent sync** (`src/lib/domain/plaidSync.ts`, `syncPlaidTransactions`).
+  Modeled on Plaid's own `/transactions/sync` primitive: `added`/`modified`/
+  `removed` merged against local transactions keyed by `plaidTransactionId`.
+  A replayed `added` batch updates in place rather than duplicating. A
+  pending transaction's `removed` entry plus its posted `added`
+  replacement (linked via `pendingTransactionId`) reconcile onto the
+  same local row — same internal `id`, category, merchant name, bill
+  link, everything — never a new row.
+- **Raw/normalized separation held exactly**: a `modified` event only
+  ever touches raw-side fields; `categoryId`/`normalizedMerchantName`/
+  `needsReview`/`billId` survive every sync, whether they came from
+  merchant-memory auto-categorization or an explicit user correction —
+  by construction, not by tracking which one it was.
+- **`/transactions/sync` pagination + cursor safety**
+  (`src/lib/plaid/syncOrchestration.ts`). `fetchCompletePlaidSyncBatch`
+  aggregates every page before any reconciliation runs, and restarts
+  entirely from the original starting cursor (never resumes from the
+  failed page) on `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION`.
+  `runPlaidTransactionsSync` only returns a new cursor after the merged
+  batch has been successfully persisted — a failed persist means no
+  cursor is ever produced, so `plaid_items.transactions_cursor` can't
+  advance for a sync that wasn't actually saved.
+- **Full historical backfill**: Link token requests `days_requested: 730`
+  (Plaid defaults to 90) and includes `transactions` in `products`, both
+  fixed at the Item's initial creation, since Plaid can't change them
+  later. Backfill itself reuses `syncPlaidTransactions` — no second
+  ingestion path.
+- **Webhook-driven sync**: `SYNC_UPDATES_AVAILABLE` (Plaid's canonical
+  path; the older `HISTORICAL_UPDATE`/`INITIAL_UPDATE` webhooks are
+  ignored) always triggers the same sync orchestration for that Item.
+  Its `historical_update_complete` flag, when true, additionally marks
+  `PlaidItem.historicalPullComplete` as a side effect of that same sync
+  call — never a flag set in place of syncing.
+- **Item/account/liability persistence**: `syncPlaidAccounts` and
+  `syncPlaidLiabilities` create-or-update `Account`/`Debt` records by
+  their Plaid ids, entirely separate from the transaction/category path
+  (proven by test — liability sync never touches a transaction).
+  `applyPlaidWebhookError`/`clearPlaidItemError` are pure `PlaidItem` ->
+  `PlaidItem` transitions that structurally cannot touch historical data,
+  since they don't take accounts/transactions as arguments at all.
+- **Access-token safety**: `plaid_items.access_token` has no RLS policy
+  granting it to anything but the service role; no shared/domain type
+  carries it (`PlaidItem` has no such field); every route response is
+  hand-built from safe fields, never a spread of a raw item/error object;
+  Plaid SDK errors are sanitized (`error_code`/`error_message` only,
+  never the raw error's request config) before being logged or returned.
+- Supabase migration amended in place: `transactions` extended with
+  `plaid_transaction_id`/`plaid_pending_transaction_id`; new
+  `plaid_items` and `account_balance_snapshots` (Step 6 storage hook
+  only — no roll-forward/offset logic reads it yet) tables.
+
+Out of scope this pass, flagged rather than silently skipped: Plaid
+webhook JWT signature verification (needed before this route is exposed
+on a real deployment); paycheck auto-matching against incoming deposits;
+mortgage/student-loan liability shapes (credit-card liabilities only).
+
 ## v2 rv2.3 — 2026-09-18
 
 Step 4 of the build sequence: the transaction model. Local/seeded data
